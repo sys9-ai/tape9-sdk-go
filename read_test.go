@@ -147,3 +147,36 @@ func TestClientReadRejectsContentPartWithoutURL(t *testing.T) {
 		t.Fatalf("read error = %q, want %q", got, want)
 	}
 }
+
+func TestClientReadDownloadsLargeContentPart(t *testing.T) {
+	payload := bytes.Repeat([]byte("x"), defaultUploadChunkSizeBytes+1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/v1/spaces/space/tapes/tape/content":
+			_ = json.NewEncoder(w).Encode(contentResponse{
+				ResumeToken: "resume-1",
+				Parts: []contentPart{{
+					ByteCount: int64(len(payload)),
+					URL:       "content-part",
+				}},
+			})
+		case "/v1/spaces/space/tapes/tape/content-part":
+			_, _ = w.Write(payload)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+	var out bytes.Buffer
+	if _, err := client.Read(context.Background(), "space", "tape", &out); err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if !bytes.Equal(out.Bytes(), payload) {
+		t.Fatalf("downloaded payload length = %d, want %d", out.Len(), len(payload))
+	}
+}

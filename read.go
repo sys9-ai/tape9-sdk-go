@@ -1,27 +1,59 @@
 package tape9
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"time"
 
 	"golang.org/x/sync/errgroup"
 )
 
-const defaultReadConcurrency = 32
+const (
+	defaultReadConcurrency      = 8
+	maxBufferedContentPartBytes = 4 * 1024 * 1024
+)
+
+type temporarySegment struct {
+	file *os.File
+	path string
+}
+
+// Read implements io.Reader.
+func (s *temporarySegment) Read(p []byte) (int, error) {
+	return s.file.Read(p)
+}
+
+// Close releases and removes the temporary content-part file.
+func (s *temporarySegment) Close() error {
+	return errors.Join(s.file.Close(), os.Remove(s.path))
+}
 
 // ReadMetrics describes the storage-side phases for one successful read or pull.
 type ReadMetrics struct {
-	Content             time.Duration
-	SegmentFetch        time.Duration
-	Total               time.Duration
-	SegmentCount        int
-	SegmentBytes        int64
+	// Content is the time spent resolving the visible content snapshot.
+	Content time.Duration
+
+	// SegmentFetch is the cumulative wall time of the parallel download batches.
+	SegmentFetch time.Duration
+
+	// Total is the complete SDK read duration, including writes to the caller.
+	Total time.Duration
+
+	// SegmentCount is the number of storage segments in the snapshot.
+	SegmentCount int
+
+	// SegmentBytes is the encoded byte count downloaded from storage.
+	SegmentBytes int64
+
+	// SegmentSourceCounts groups segments by their server-provided source label.
 	SegmentSourceCounts map[string]int
 }
 
@@ -138,8 +170,13 @@ func (c *Client) downloadSegments(ctx context.Context, targets []segmentTarget, 
 		fetchDuration += batchFetchDuration
 
 		writeStartedAt := time.Now()
-		for _, payload := range payloads {
+		for index, payload := range payloads {
 			if err := writeSegmentPayload(w, payload, payloadFormat, decoder); err != nil {
+				closeSegmentPayloads(payloads[index:])
+				return err
+			}
+			if err := payload.Close(); err != nil {
+				closeSegmentPayloads(payloads[index+1:])
 				return err
 			}
 		}
@@ -151,18 +188,27 @@ func (c *Client) downloadSegments(ctx context.Context, targets []segmentTarget, 
 	return nil
 }
 
-func writeSegmentPayload(w io.Writer, payload []byte, payloadFormat payloadFormat, decoder interface {
+func closeSegmentPayloads(payloads []io.ReadCloser) {
+	for _, payload := range payloads {
+		if payload != nil {
+			_ = payload.Close()
+		}
+	}
+}
+
+func writeSegmentPayload(w io.Writer, payload io.Reader, payloadFormat payloadFormat, decoder interface {
 	DecodeAll(input, dst []byte) ([]byte, error)
 	Close()
 }) error {
 	switch payloadFormat {
 	case payloadFormatIdentity:
-		return writePayload(w, payload)
+		_, err := io.Copy(w, payload)
+		return err
 	case payloadFormatFramedZstdV1:
 		if decoder == nil {
 			return fmt.Errorf("missing decoder for payload format %q", payloadFormat)
 		}
-		return decodeFramedZstdSegment(payload, decoder, w)
+		return decodeFramedZstdReader(payload, decoder, w)
 	default:
 		return fmt.Errorf("invalid payload format: %q", payloadFormat)
 	}
@@ -191,8 +237,8 @@ func storageDownloadContext(baseCtx context.Context, deadline time.Time, hasDead
 	return context.WithDeadline(baseCtx, deadline.Add(writeDuration))
 }
 
-func (c *Client) downloadSegmentBatch(ctx context.Context, targets []segmentTarget, parts []contentPart) ([][]byte, time.Duration, error) {
-	payloads := make([][]byte, len(parts))
+func (c *Client) downloadSegmentBatch(ctx context.Context, targets []segmentTarget, parts []contentPart) ([]io.ReadCloser, time.Duration, error) {
+	payloads := make([]io.ReadCloser, len(parts))
 	group, groupCtx := errgroup.WithContext(ctx)
 	fetchStartedAt := time.Now()
 
@@ -211,6 +257,7 @@ func (c *Client) downloadSegmentBatch(ctx context.Context, targets []segmentTarg
 	}
 
 	if err := group.Wait(); err != nil {
+		closeSegmentPayloads(payloads)
 		return nil, 0, err
 	}
 	fetchDuration := time.Since(fetchStartedAt)
@@ -262,8 +309,8 @@ func resolveContentPartTarget(contentURL *url.URL, part contentPart) (segmentTar
 	return target, nil
 }
 
-func (c *Client) downloadSegment(ctx context.Context, segURL *url.URL, byteCount int64, needsSecret bool) ([]byte, error) {
-	var payload []byte
+func (c *Client) downloadSegment(ctx context.Context, segURL *url.URL, byteCount int64, needsSecret bool) (io.ReadCloser, error) {
+	var payload io.ReadCloser
 	err := c.doWithRetry(ctx, func(attemptCtx context.Context) error {
 		attemptCtx, cancel := context.WithTimeout(attemptCtx, c.requestTimeout)
 		defer cancel()
@@ -288,13 +335,43 @@ func (c *Client) downloadSegment(ctx context.Context, segURL *url.URL, byteCount
 			return fmt.Errorf("content part shorter than expected: %d < %d", attemptResp.ContentLength, byteCount)
 		}
 
-		payload, err = readSegmentPayload(attemptResp.Body, byteCount)
+		if byteCount <= maxBufferedContentPartBytes {
+			body, err := readSegmentPayload(attemptResp.Body, byteCount)
+			if err != nil {
+				return err
+			}
+			payload = io.NopCloser(bytes.NewReader(body))
+			return nil
+		}
+		payload, err = readSegmentFile(attemptResp.Body, byteCount)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
 	return payload, nil
+}
+
+func readSegmentFile(r io.Reader, byteCount int64) (io.ReadCloser, error) {
+	file, err := os.CreateTemp("", "tape9-content-*")
+	if err != nil {
+		return nil, err
+	}
+	path := file.Name()
+	cleanup := func() {
+		_ = file.Close()
+		_ = os.Remove(path)
+	}
+
+	if _, err := io.CopyN(file, r, byteCount); err != nil {
+		cleanup()
+		return nil, err
+	}
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		cleanup()
+		return nil, err
+	}
+	return &temporarySegment{file: file, path: path}, nil
 }
 
 func readSegmentPayload(r io.Reader, byteCount int64) ([]byte, error) {

@@ -14,6 +14,19 @@ import (
 
 const errorBodyLimitBytes = 4 * 1024
 
+func TestReadErrorBodyDrainsResponseForConnectionReuse(t *testing.T) {
+	reader := strings.NewReader(strings.Repeat("x", errorBodyLimitBytes*2))
+	resp := &http.Response{Body: io.NopCloser(reader)}
+
+	body := readErrorBody(resp)
+	if got, want := len(body), errorBodyLimitBytes; got != want {
+		t.Fatalf("error body length = %d, want %d", got, want)
+	}
+	if remaining := reader.Len(); remaining != 0 {
+		t.Fatalf("response body has %d unread bytes", remaining)
+	}
+}
+
 func TestNewRejectsQueryOrFragment(t *testing.T) {
 	_, err := New("http://example.com?x=y")
 	if err == nil {

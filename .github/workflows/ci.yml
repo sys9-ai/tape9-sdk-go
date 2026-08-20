@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  GOPRIVATE: ""
+  GONOPROXY: ""
+  GONOSUMDB: ""
+  GOPROXY: https://proxy.golang.org
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Download public dependencies
+        run: go mod download
+
+      - name: Run go vet
+        run: GOOS=linux GOARCH=amd64 go vet ./...
+
+      - name: Run go test
+        run: go test ./...

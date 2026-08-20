@@ -76,6 +76,102 @@ func TestClientCaptureUploadsMergedOutputAndExitCode(t *testing.T) {
 	}
 }
 
+func TestClientCaptureReadsOriginalSpoolAfterPathReplacement(t *testing.T) {
+	state := newCaptureTestServerState()
+	createStarted := make(chan struct{})
+	releaseCreate := make(chan struct{})
+	baseHandler := captureTestHandler(t, state)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost && r.URL.Path == "/v1/spaces/space/tapes" {
+			close(createStarted)
+			<-releaseCreate
+		}
+		baseHandler(w, r)
+	}))
+	defer server.Close()
+
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatalf("new client: %v", err)
+	}
+
+	t.Setenv("GO_WANT_HELPER_PROCESS", "1")
+	spoolDir := t.TempDir()
+	forward := &readySignalWriter{ready: make(chan struct{})}
+	type captureCall struct {
+		res CaptureResult
+		err error
+	}
+	done := make(chan captureCall, 1)
+	go func() {
+		res, err := client.Capture(
+			context.Background(),
+			"space",
+			"tape",
+			[]string{os.Args[0], "-test.run=TestCaptureHelper", "--", "ready_then_exit"},
+			forward,
+			CaptureOptions{PollInterval: time.Millisecond, SpoolDir: spoolDir},
+		)
+		done <- captureCall{res: res, err: err}
+	}()
+
+	<-createStarted
+	<-forward.ready
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		t.Fatalf("read spool dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("spool file count = %d, want 1", len(entries))
+	}
+	spoolPath := filepath.Join(spoolDir, entries[0].Name())
+	if err := os.Remove(spoolPath); err != nil {
+		t.Fatalf("remove spool path: %v", err)
+	}
+	if err := os.WriteFile(spoolPath, []byte("replacement\n"), 0o600); err != nil {
+		t.Fatalf("replace spool path: %v", err)
+	}
+	close(releaseCreate)
+
+	got := <-done
+	if got.err != nil {
+		t.Fatalf("capture: %v", got.err)
+	}
+	if got.res.AppendErr != nil {
+		t.Fatalf("append: %v", got.res.AppendErr)
+	}
+	if payload := string(state.concatPayload()); payload != "ready\n" {
+		t.Fatalf("uploaded payload = %q, want original spool bytes", payload)
+	}
+}
+
+func TestTailReaderStopsPollingWhenWritingFinishes(t *testing.T) {
+	spool, err := os.CreateTemp(t.TempDir(), "spool-*")
+	if err != nil {
+		t.Fatalf("create spool: %v", err)
+	}
+	defer spool.Close()
+
+	doneWriting := make(chan struct{})
+	reader := &tailReader{f: spool, done: doneWriting, pollInterval: time.Second}
+	readDone := make(chan error, 1)
+	go func() {
+		_, err := reader.Read(make([]byte, 1))
+		readDone <- err
+	}()
+
+	time.Sleep(20 * time.Millisecond)
+	close(doneWriting)
+	select {
+	case err := <-readDone:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("read error = %v, want EOF", err)
+		}
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("tail reader remained blocked in poll interval")
+	}
+}
+
 func TestClientCaptureForwardsRetainModeToCreateTape(t *testing.T) {
 	state := newCaptureTestServerState()
 	server := httptest.NewServer(captureTestHandler(t, state))
@@ -806,6 +902,9 @@ func TestCaptureHelper(t *testing.T) {
 		os.Exit(7)
 	case "stdout_only_exit_0":
 		_, _ = fmt.Fprint(os.Stdout, "ok\n")
+		os.Exit(0)
+	case "ready_then_exit":
+		_, _ = fmt.Fprint(os.Stdout, "ready\n")
 		os.Exit(0)
 	case "stdout_head_then_tail":
 		_, _ = fmt.Fprint(os.Stdout, "head\n")

@@ -16,21 +16,43 @@ const maxUsageScopes = 1024
 // RetentionDroppedLogicalBytes is nil until retention tracking has a complete
 // baseline; RetentionTrackingStartedAt identifies the beginning of that window.
 type TapeUsage struct {
-	TapeID                       string     `json:"tape_id"`
-	LogicalBytes                 *int64     `json:"logical_bytes"`
-	StoredBytes                  int64      `json:"stored_bytes"`
-	RetainApplied                bool       `json:"retain_applied"`
-	DroppedBytes                 int64      `json:"dropped_bytes"`
-	RetentionDroppedLogicalBytes *int64     `json:"retention_dropped_logical_bytes"`
-	RetentionTrackingStartedAt   *time.Time `json:"retention_tracking_started_at"`
+	// TapeID identifies the tape described by this usage result.
+	TapeID string `json:"tape_id"`
+
+	// LogicalBytes is the current decoded payload size, when known.
+	LogicalBytes *int64 `json:"logical_bytes"`
+
+	// StoredBytes is the current encoded payload size.
+	StoredBytes int64 `json:"stored_bytes"`
+
+	// RetainApplied reports whether retention has hidden stored bytes.
+	RetainApplied bool `json:"retain_applied"`
+
+	// DroppedBytes is the encoded byte count hidden by retention.
+	DroppedBytes int64 `json:"dropped_bytes"`
+
+	// RetentionDroppedLogicalBytes is the logical byte count hidden by retention, when known.
+	RetentionDroppedLogicalBytes *int64 `json:"retention_dropped_logical_bytes"`
+
+	// RetentionTrackingStartedAt is the beginning of the complete logical-retention window.
+	RetentionTrackingStartedAt *time.Time `json:"retention_tracking_started_at"`
 }
 
 // UsageSummary aggregates payload usage for caller-owned usage scopes.
 type UsageSummary struct {
-	TapeCount                      int64      `json:"tape_count"`
-	LogicalBytes                   *int64     `json:"logical_bytes"`
-	StoredBytes                    int64      `json:"stored_bytes"`
-	RetentionDroppedLogicalBytes   *int64     `json:"retention_dropped_logical_bytes"`
+	// TapeCount is the number of live tapes in the requested scopes.
+	TapeCount int64 `json:"tape_count"`
+
+	// LogicalBytes is the aggregate decoded payload size, when known.
+	LogicalBytes *int64 `json:"logical_bytes"`
+
+	// StoredBytes is the aggregate encoded payload size.
+	StoredBytes int64 `json:"stored_bytes"`
+
+	// RetentionDroppedLogicalBytes is the aggregate logical byte count hidden by retention, when known.
+	RetentionDroppedLogicalBytes *int64 `json:"retention_dropped_logical_bytes"`
+
+	// RetentionTrackingCompleteSince is the earliest complete logical-retention boundary for the aggregate.
 	RetentionTrackingCompleteSince *time.Time `json:"retention_tracking_complete_since"`
 }
 

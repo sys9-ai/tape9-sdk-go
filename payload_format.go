@@ -13,7 +13,7 @@ const (
 	payloadFormatFramedZstdV1 payloadFormat = "framed-zstd-v1"
 )
 
-func (f payloadFormat) IsValid() bool {
+func (f payloadFormat) isValid() bool {
 	switch f {
 	case payloadFormatIdentity, payloadFormatFramedZstdV1:
 		return true
@@ -22,7 +22,7 @@ func (f payloadFormat) IsValid() bool {
 	}
 }
 
-func (f payloadFormat) OrDefault() payloadFormat {
+func (f payloadFormat) orDefault() payloadFormat {
 	if f == "" {
 		return payloadFormatIdentity
 	}
@@ -34,7 +34,7 @@ func storedPayloadFormat(raw string) (payloadFormat, error) {
 	if format == "" {
 		return payloadFormatIdentity, nil
 	}
-	if !format.IsValid() {
+	if !format.isValid() {
 		return "", fmt.Errorf("invalid payload_format: %q", raw)
 	}
 	return format, nil

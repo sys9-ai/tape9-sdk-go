@@ -16,6 +16,7 @@ const (
 	CompressionZstd Compression = "zstd"
 )
 
+// IsValid reports whether c is a supported payload compression mode.
 func (c Compression) IsValid() bool {
 	switch c {
 	case CompressionNone, CompressionZstd:

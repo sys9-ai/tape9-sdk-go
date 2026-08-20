@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -375,7 +376,7 @@ func TestClientAppendWithFramedZstdWaitsForEOFOnGenericReaders(t *testing.T) {
 	}
 }
 
-func TestClientAppendWithFramedZstdHonorsContextCancelOnBlockingGenericReader(t *testing.T) {
+func TestClientAppendWithFramedZstdClosesBlockingSourceOnContextCancel(t *testing.T) {
 	state := newCaptureTestServerState()
 	server := httptest.NewServer(captureTestHandler(t, state))
 	defer server.Close()
@@ -386,15 +387,14 @@ func TestClientAppendWithFramedZstdHonorsContextCancelOnBlockingGenericReader(t 
 	}
 	setFramedZstdUploadFlushIntervalForTest(t, client, time.Hour)
 
-	tailReady := make(chan struct{})
-	defer close(tailReady)
+	reader := newCloseableDelayedTailReader()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 	defer cancel()
 
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.Append(ctx, "space", "tape", &delayedTailReader{tailReady: tailReady}, AppendOptions{
+		_, err := client.Append(ctx, "space", "tape", reader, AppendOptions{
 			Compression: CompressionZstd,
 		})
 		done <- err
@@ -407,6 +407,12 @@ func TestClientAppendWithFramedZstdHonorsContextCancelOnBlockingGenericReader(t 
 		}
 	case <-time.After(500 * time.Millisecond):
 		t.Fatal("append hung past context deadline")
+	}
+
+	select {
+	case <-reader.closed:
+	case <-time.After(500 * time.Millisecond):
+		t.Fatal("append did not close the blocking reader")
 	}
 }
 
@@ -459,7 +465,7 @@ func TestClientAppendDeleteRecoverySwitchesToFramedZstdReader(t *testing.T) {
 	var (
 		framedCreateTapeCalls int
 		createStreamCalls     int
-		chunks                [][]byte
+		chunks                = make(chan []byte, 2)
 	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -499,7 +505,7 @@ func TestClientAppendDeleteRecoverySwitchesToFramedZstdReader(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read chunk body: %v", err)
 			}
-			chunks = append(chunks, body)
+			chunks <- body
 			w.WriteHeader(http.StatusNoContent)
 		case r.Method == http.MethodPost && r.URL.Path == "/v1/spaces/space/tapes/tape/streams/stream-2/close":
 			w.WriteHeader(http.StatusNoContent)
@@ -519,10 +525,10 @@ func TestClientAppendDeleteRecoverySwitchesToFramedZstdReader(t *testing.T) {
 	release := make(chan struct{})
 	done := make(chan error, 1)
 	go func() {
-		_, err := client.Append(context.Background(), "space", "tape", &headTailThenReleaseReader{
+		_, err := client.Append(context.Background(), "space", "tape", io.NopCloser(&headTailThenReleaseReader{
 			tailReady: tailReady,
 			release:   release,
-		}, AppendOptions{
+		}), AppendOptions{
 			Compression: CompressionZstd,
 		})
 		done <- err
@@ -530,16 +536,15 @@ func TestClientAppendDeleteRecoverySwitchesToFramedZstdReader(t *testing.T) {
 
 	close(tailReady)
 
-	deadline := time.Now().Add(300 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		if len(chunks) == 2 {
-			break
+	uploadedChunks := make([][]byte, 0, 2)
+	for len(uploadedChunks) < 2 {
+		select {
+		case chunk := <-chunks:
+			uploadedChunks = append(uploadedChunks, chunk)
+		case <-time.After(300 * time.Millisecond):
+			close(release)
+			t.Fatalf("expected replayed head chunk and flushed tail chunk before EOF after delete recovery, got %d chunks", len(uploadedChunks))
 		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	if len(chunks) != 2 {
-		close(release)
-		t.Fatalf("expected replayed head chunk and flushed tail chunk before EOF after delete recovery, got %d chunks", len(chunks))
 	}
 
 	decoder, err := newFramedZstdDecoder()
@@ -548,7 +553,7 @@ func TestClientAppendDeleteRecoverySwitchesToFramedZstdReader(t *testing.T) {
 		t.Fatalf("new decoder: %v", err)
 	}
 	var decoded bytes.Buffer
-	if err := decodeFramedZstdSegment(chunks[0], decoder, &decoded); err != nil {
+	if err := decodeFramedZstdSegment(uploadedChunks[0], decoder, &decoded); err != nil {
 		decoder.Close()
 		close(release)
 		t.Fatalf("decode first chunk: %v", err)
@@ -559,7 +564,7 @@ func TestClientAppendDeleteRecoverySwitchesToFramedZstdReader(t *testing.T) {
 	}
 
 	decoded.Reset()
-	if err := decodeFramedZstdSegment(chunks[1], decoder, &decoded); err != nil {
+	if err := decodeFramedZstdSegment(uploadedChunks[1], decoder, &decoded); err != nil {
 		decoder.Close()
 		close(release)
 		t.Fatalf("decode second chunk: %v", err)
@@ -1192,6 +1197,56 @@ func TestPutFramedZstdChunkWithRetryClearsAmbiguityAfterPayloadTooLargeProof(t *
 	}
 	if got, want := decoded.String(), "cd"; got != want {
 		t.Fatalf("right split payload = %q, want %q", got, want)
+	}
+}
+
+func TestPutFramedZstdChunkWithRetryCapsDecodedFrameSize(t *testing.T) {
+	var frames [][]byte
+	putter := fakeChunkPutter{
+		putFn: func(_ context.Context, _, _, _ string, _ int64, _ string, payload []byte) error {
+			frames = append(frames, append([]byte(nil), payload...))
+			return nil
+		},
+	}
+	encoder, err := newFramedZstdEncoder()
+	if err != nil {
+		t.Fatalf("new encoder: %v", err)
+	}
+	defer encoder.Close()
+
+	raw := bytes.Repeat([]byte("a"), defaultFramedZstdRawWindowBytes+1)
+	nextSequence, chunks, logicalBytes, ambiguous, err := putFramedZstdChunkWithRetry(
+		context.Background(),
+		retryConfig{maxRetryTime: time.Second},
+		&putter,
+		time.Second,
+		"space",
+		"tape",
+		"stream",
+		0,
+		raw,
+		encoder,
+	)
+	if err != nil {
+		t.Fatalf("put framed zstd chunk: %v", err)
+	}
+	if nextSequence != 2 || chunks != 2 || logicalBytes != int64(len(raw)) || ambiguous {
+		t.Fatalf("unexpected result: next=%d chunks=%d bytes=%d ambiguous=%t", nextSequence, chunks, logicalBytes, ambiguous)
+	}
+
+	decoder, err := newFramedZstdDecoder()
+	if err != nil {
+		t.Fatalf("new decoder: %v", err)
+	}
+	defer decoder.Close()
+	var decoded bytes.Buffer
+	for _, frame := range frames {
+		if err := decodeFramedZstdSegment(frame, decoder, &decoded); err != nil {
+			t.Fatalf("decode frame: %v", err)
+		}
+	}
+	if !bytes.Equal(decoded.Bytes(), raw) {
+		t.Fatalf("decoded bytes = %d, want %d", decoded.Len(), len(raw))
 	}
 }
 
@@ -2198,6 +2253,32 @@ type delayedTailReader struct {
 	tailReady <-chan struct{}
 	sentHead  bool
 	sentTail  bool
+}
+
+type closeableDelayedTailReader struct {
+	closed    chan struct{}
+	closeOnce sync.Once
+	sentHead  bool
+}
+
+func newCloseableDelayedTailReader() *closeableDelayedTailReader {
+	return &closeableDelayedTailReader{closed: make(chan struct{})}
+}
+
+func (r *closeableDelayedTailReader) Read(p []byte) (int, error) {
+	if !r.sentHead {
+		r.sentHead = true
+		return copy(p, "head\n"), nil
+	}
+	<-r.closed
+	return 0, io.EOF
+}
+
+func (r *closeableDelayedTailReader) Close() error {
+	r.closeOnce.Do(func() {
+		close(r.closed)
+	})
+	return nil
 }
 
 func (r *delayedTailReader) Read(p []byte) (int, error) {

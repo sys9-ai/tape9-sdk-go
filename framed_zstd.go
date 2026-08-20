@@ -1,6 +1,7 @@
 package tape9
 
 import (
+	"bytes"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -26,7 +27,7 @@ func newFramedZstdEncoder() (*zstd.Encoder, error) {
 }
 
 func newFramedZstdDecoder() (*zstd.Decoder, error) {
-	return zstd.NewReader(nil)
+	return zstd.NewReader(nil, zstd.WithDecoderMaxMemory(defaultFramedZstdRawWindowBytes))
 }
 
 func encodeFramedZstdChunk(raw []byte, encoder zstdEncoder) []byte {
@@ -38,29 +39,39 @@ func encodeFramedZstdChunk(raw []byte, encoder zstdEncoder) []byte {
 }
 
 func decodeFramedZstdSegment(segment []byte, decoder zstdDecoder, w io.Writer) error {
-	for len(segment) > 0 {
-		if len(segment) < framedZstdHeaderSize {
+	return decodeFramedZstdReader(bytes.NewReader(segment), decoder, w)
+}
+
+func decodeFramedZstdReader(r io.Reader, decoder zstdDecoder, w io.Writer) error {
+	header := make([]byte, framedZstdHeaderSize)
+	for {
+		_, err := io.ReadFull(r, header)
+		if err == io.EOF {
+			return nil
+		}
+		if err != nil {
 			return fmt.Errorf("invalid framed-zstd segment: truncated header")
 		}
 
-		compressedLen := int(binary.BigEndian.Uint32(segment[:framedZstdHeaderSize]))
-		segment = segment[framedZstdHeaderSize:]
+		compressedLen := int(binary.BigEndian.Uint32(header))
 		if compressedLen <= 0 {
 			return fmt.Errorf("invalid framed-zstd segment: invalid compressed length %d", compressedLen)
 		}
-		if len(segment) < compressedLen {
+		if compressedLen > defaultUploadChunkSizeBytes-framedZstdHeaderSize {
+			return fmt.Errorf("invalid framed-zstd segment: compressed length %d exceeds maximum", compressedLen)
+		}
+
+		compressed := make([]byte, compressedLen)
+		if _, err := io.ReadFull(r, compressed); err != nil {
 			return fmt.Errorf("invalid framed-zstd segment: truncated payload")
 		}
 
-		raw, err := decoder.DecodeAll(segment[:compressedLen], nil)
+		raw, err := decoder.DecodeAll(compressed, nil)
 		if err != nil {
 			return err
 		}
 		if err := writePayload(w, raw); err != nil {
 			return err
 		}
-		segment = segment[compressedLen:]
 	}
-
-	return nil
 }

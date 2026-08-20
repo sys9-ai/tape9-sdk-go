@@ -125,13 +125,13 @@ func (c *Client) createTape(ctx context.Context, spaceID string, tapeID string, 
 	if opts.RetainMode != "" && !opts.RetainMode.IsValid() {
 		return "", fmt.Errorf("invalid retain mode: %q", opts.RetainMode)
 	}
-	if opts.PayloadFormat != "" && !opts.PayloadFormat.IsValid() {
+	if opts.PayloadFormat != "" && !opts.PayloadFormat.isValid() {
 		return "", fmt.Errorf("invalid payload format: %q", opts.PayloadFormat)
 	}
 	if opts.UsageScope != "" && !IsValidID(opts.UsageScope) {
 		return "", fmt.Errorf("invalid usage_scope: %q", opts.UsageScope)
 	}
-	selectedFormat := opts.PayloadFormat.OrDefault()
+	selectedFormat := opts.PayloadFormat.orDefault()
 
 	var body respBody
 	var bodyBytes []byte
@@ -361,10 +361,14 @@ func (c *Client) closeStream(ctx context.Context, spaceID, tapeID, streamID stri
 	})
 }
 
-const maxErrorBodyBytes = 4 * 1024
+const (
+	maxErrorBodyBytes      = 4 * 1024
+	maxErrorBodyDrainBytes = 256 * 1024
+)
 
 func readErrorBody(resp *http.Response) string {
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxErrorBodyDrainBytes))
 	return strings.TrimSpace(string(b))
 }
 

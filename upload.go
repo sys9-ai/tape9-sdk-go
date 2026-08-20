@@ -65,6 +65,30 @@ type uploadResult struct {
 	LogicalBytes int64
 }
 
+type uploadRequest struct {
+	ctx              context.Context
+	teardownCtx      context.Context
+	spaceID          string
+	tapeID           string
+	reader           io.Reader
+	format           payloadFormat
+	idempotencyKey   string
+	cleanupOnFailure bool
+	reportFailure    func(error)
+	tapeOptions      createTapeOptions
+}
+
+type uploadSession struct {
+	client                    *Client
+	request                   uploadRequest
+	retryConfig               retryConfig
+	streamID                  string
+	sequence                  int64
+	format                    payloadFormat
+	incarnationCommittedBytes int64
+	ensureEncoder             func() (zstdEncoder, error)
+}
+
 // Append appends bytes from r into the target tape, creating the tape if needed.
 //
 // When opts.IdempotencyKey is empty, the SDK generates one internally and
@@ -74,6 +98,13 @@ type uploadResult struct {
 // caller-provided key fails after stream creation, the stream stays open so the
 // same key can retry the session. If the SDK generated the key, it best-effort
 // closes the stream before returning the failure.
+//
+// When the tape uses CompressionZstd, a source that waits for live bytes may
+// implement io.ReadCloser to let the SDK flush partial chunks. Its Close method
+// must interrupt an in-flight Read; the SDK closes it when framed reading ends.
+// If framed reading never begins, the caller retains ownership of the source.
+// A finite io.Reader is read synchronously and observes cancellation after Read
+// returns.
 func (c *Client) Append(ctx context.Context, spaceID string, tapeID string, r io.Reader, opts AppendOptions) (AppendResult, error) {
 	if !IsValidID(spaceID) {
 		return AppendResult{}, fmt.Errorf("invalid space_id: %q", spaceID)
@@ -106,22 +137,21 @@ func (c *Client) Append(ctx context.Context, spaceID string, tapeID string, r io
 		return AppendResult{}, err
 	}
 
-	res, err := c.uploadWithPayloadFormat(
-		ctx,
-		context.Background(),
-		spaceID,
-		gotTapeID,
-		r,
-		uploadFormat,
-		idempotencyKey,
-		cleanupOnFailure,
-		nil,
-		createTapeOptions{
+	res, err := c.uploadWithPayloadFormat(uploadRequest{
+		ctx:              ctx,
+		teardownCtx:      context.Background(),
+		spaceID:          spaceID,
+		tapeID:           gotTapeID,
+		reader:           r,
+		format:           uploadFormat,
+		idempotencyKey:   idempotencyKey,
+		cleanupOnFailure: cleanupOnFailure,
+		tapeOptions: createTapeOptions{
 			RetainMode:    opts.RetainMode,
 			PayloadFormat: selectedFormat,
 			UsageScope:    opts.UsageScope,
 		},
-	)
+	})
 	if err != nil {
 		return AppendResult{TapeID: gotTapeID}, err
 	}
@@ -134,7 +164,7 @@ func (c *Client) Append(ctx context.Context, spaceID string, tapeID string, r io
 }
 
 func (c *Client) createOrReuseAppendTape(ctx context.Context, spaceID string, tapeID string, opts createTapeOptions) (string, payloadFormat, error) {
-	selectedFormat := opts.PayloadFormat.OrDefault()
+	selectedFormat := opts.PayloadFormat.orDefault()
 	gotTapeID, err := c.createTape(ctx, spaceID, tapeID, opts)
 	if err == nil {
 		return gotTapeID, selectedFormat, nil
@@ -185,56 +215,11 @@ func isDeleteConflict(err error) bool {
 	return ok && message == "tape deleted"
 }
 
-func (c *Client) upload(ctx context.Context, teardownCtx context.Context, spaceID string, tapeID string, r io.Reader, idempotencyKey string, cleanupOnFailure bool, reportFailure func(error), tapeOpts createTapeOptions) (res uploadResult, err error) {
-	return c.uploadRawChunks(
-		ctx,
-		teardownCtx,
-		spaceID,
-		tapeID,
-		r,
-		idempotencyKey,
-		cleanupOnFailure,
-		reportFailure,
-		payloadFormatIdentity,
-		tapeOpts,
-	)
-}
-
-func (c *Client) uploadFramedZstd(ctx context.Context, teardownCtx context.Context, spaceID string, tapeID string, r io.Reader, idempotencyKey string, cleanupOnFailure bool, reportFailure func(error), tapeOpts createTapeOptions) (uploadResult, error) {
-	return c.uploadRawChunks(
-		ctx,
-		teardownCtx,
-		spaceID,
-		tapeID,
-		r,
-		idempotencyKey,
-		cleanupOnFailure,
-		reportFailure,
-		payloadFormatFramedZstdV1,
-		tapeOpts,
-	)
-}
-
-func (c *Client) uploadWithPayloadFormat(
-	ctx context.Context,
-	teardownCtx context.Context,
-	spaceID string,
-	tapeID string,
-	r io.Reader,
-	format payloadFormat,
-	idempotencyKey string,
-	cleanupOnFailure bool,
-	reportFailure func(error),
-	tapeOpts createTapeOptions,
-) (uploadResult, error) {
-	switch format {
-	case payloadFormatIdentity:
-		return c.upload(ctx, teardownCtx, spaceID, tapeID, r, idempotencyKey, cleanupOnFailure, reportFailure, tapeOpts)
-	case payloadFormatFramedZstdV1:
-		return c.uploadFramedZstd(ctx, teardownCtx, spaceID, tapeID, r, idempotencyKey, cleanupOnFailure, reportFailure, tapeOpts)
-	default:
-		return uploadResult{}, fmt.Errorf("invalid payload format: %q", format)
+func (c *Client) uploadWithPayloadFormat(request uploadRequest) (uploadResult, error) {
+	if _, err := uploadChunkBufferSize(request.format); err != nil {
+		return uploadResult{}, err
 	}
+	return c.uploadRawChunks(request)
 }
 
 func uploadChunkBufferSize(format payloadFormat) (int, error) {
@@ -248,7 +233,7 @@ func uploadChunkBufferSize(format payloadFormat) (int, error) {
 	}
 }
 
-func readUploadChunk(r io.Reader, format payloadFormat, buf []byte) (int, error) {
+func readUploadChunk(ctx context.Context, r io.Reader, format payloadFormat, buf []byte) (int, error) {
 	switch format {
 	case payloadFormatIdentity:
 		return r.Read(buf)
@@ -256,7 +241,18 @@ func readUploadChunk(r io.Reader, format payloadFormat, buf []byte) (int, error)
 		if chunkReader, ok := r.(uploadChunkReader); ok {
 			return chunkReader.ReadUploadChunk(buf)
 		}
-		return io.ReadFull(r, buf)
+		total := 0
+		for total < len(buf) {
+			if err := ctx.Err(); err != nil {
+				return total, err
+			}
+			n, err := r.Read(buf[total:])
+			total += n
+			if err != nil {
+				return total, err
+			}
+		}
+		return total, nil
 	default:
 		return 0, fmt.Errorf("invalid payload format: %q", format)
 	}
@@ -273,18 +269,7 @@ func uploadReadDone(format payloadFormat, err error) bool {
 	}
 }
 
-func (c *Client) uploadRawChunks(
-	ctx context.Context,
-	teardownCtx context.Context,
-	spaceID string,
-	tapeID string,
-	r io.Reader,
-	idempotencyKey string,
-	cleanupOnFailure bool,
-	reportFailure func(error),
-	initialFormat payloadFormat,
-	tapeOpts createTapeOptions,
-) (res uploadResult, err error) {
+func (c *Client) uploadRawChunks(request uploadRequest) (res uploadResult, err error) {
 	maxChunkSize := defaultUploadChunkSizeBytes
 	if defaultFramedZstdRawWindowBytes > maxChunkSize {
 		maxChunkSize = defaultFramedZstdRawWindowBytes
@@ -325,106 +310,92 @@ func (c *Client) uploadRawChunks(
 		}
 		switch format {
 		case payloadFormatIdentity:
-			return r, nil
+			return request.reader, nil
 		case payloadFormatFramedZstdV1:
-			if _, ok := r.(uploadChunkReader); ok {
-				return r, nil
+			if _, ok := request.reader.(uploadChunkReader); ok {
+				return request.reader, nil
 			}
-			framedReader = newFramedZstdUploadReader(ctx, r, c.framedZstdUploadFlushInterval)
-			return framedReader, nil
+			if readCloser, ok := request.reader.(io.ReadCloser); ok {
+				framedReader = newFramedZstdUploadReader(request.ctx, readCloser, c.framedZstdUploadFlushInterval)
+				return framedReader, nil
+			}
+			return request.reader, nil
 		default:
 			return nil, fmt.Errorf("invalid payload format: %q", format)
 		}
 	}
 
-	return c.uploadWithStream(ctx, teardownCtx, spaceID, tapeID, idempotencyKey, cleanupOnFailure, reportFailure, func(streamID string) (uploadResult, string, error) {
+	return c.uploadWithStream(request, func(streamID string) (uploadResult, string, error) {
 		buf := make([]byte, maxChunkSize)
-		retryCfg := c.retryConfig()
-
 		res := uploadResult{}
-		seq := int64(0)
-		currentFormat := initialFormat
-		currentIncarnationCommittedBytes := int64(0)
+		session := uploadSession{
+			client:        c,
+			request:       request,
+			retryConfig:   c.retryConfig(),
+			streamID:      streamID,
+			format:        request.format,
+			ensureEncoder: ensureEncoder,
+		}
 
 		for {
-			readFormat := currentFormat
+			readFormat := session.format
 			chunkSize, err := uploadChunkBufferSize(readFormat)
 			if err != nil {
-				return uploadResult{}, streamID, err
+				return uploadResult{}, session.streamID, err
 			}
 
 			readSource, err := readSourceForFormat(readFormat)
 			if err != nil {
-				return uploadResult{}, streamID, err
+				return uploadResult{}, session.streamID, err
 			}
 
-			n, readErr := readUploadChunk(readSource, readFormat, buf[:chunkSize])
+			n, readErr := readUploadChunk(request.ctx, readSource, readFormat, buf[:chunkSize])
 			if n > 0 {
-				nextSeq, nextStreamID, nextFormat, uploadedChunks, uploadedBytes, chunkErr := c.putChunkRecoveringFromDelete(
-					ctx,
-					teardownCtx,
-					retryCfg,
-					spaceID,
-					tapeID,
-					streamID,
-					seq,
-					buf[:n],
-					currentFormat,
-					ensureEncoder,
-					currentIncarnationCommittedBytes > 0,
-					idempotencyKey,
-					cleanupOnFailure,
-					tapeOpts,
-					reportFailure,
-				)
+				uploadedChunks, uploadedBytes, chunkErr := session.putChunk(buf[:n])
 				if chunkErr != nil {
-					return uploadResult{}, nextStreamID, chunkErr
+					return uploadResult{}, session.streamID, chunkErr
 				}
-				streamID = nextStreamID
-				seq = nextSeq
-				currentFormat = nextFormat
 				res.Chunks += uploadedChunks
 				res.LogicalBytes += uploadedBytes
-				currentIncarnationCommittedBytes += uploadedBytes
 			}
 
 			if uploadReadDone(readFormat, readErr) {
-				return res, streamID, nil
+				return res, session.streamID, nil
 			}
 			if readErr != nil {
-				return uploadResult{}, streamID, readErr
+				return uploadResult{}, session.streamID, readErr
 			}
 		}
 	})
 }
 
-func (c *Client) uploadWithStream(ctx context.Context, teardownCtx context.Context, spaceID string, tapeID string, idempotencyKey string, cleanupOnFailure bool, reportFailure func(error), upload func(streamID string) (uploadResult, string, error)) (res uploadResult, err error) {
-	streamID, err := c.createStream(ctx, spaceID, tapeID, createStreamOptions{IdempotencyKey: idempotencyKey})
+func (c *Client) uploadWithStream(request uploadRequest, upload func(streamID string) (uploadResult, string, error)) (res uploadResult, err error) {
+	streamID, err := c.createStream(request.ctx, request.spaceID, request.tapeID, createStreamOptions{IdempotencyKey: request.idempotencyKey})
 	if err != nil {
-		if reportFailure != nil {
-			reportFailure(err)
+		if request.reportFailure != nil {
+			request.reportFailure(err)
 		}
-		if cleanupOnFailure {
-			c.bestEffortResolveAndCloseUploadStream(teardownCtx, spaceID, tapeID, idempotencyKey)
+		if request.cleanupOnFailure {
+			c.bestEffortResolveAndCloseUploadStream(request.teardownCtx, request.spaceID, request.tapeID, request.idempotencyKey)
 		}
 		return uploadResult{}, err
 	}
 	defer func() {
-		if !cleanupOnFailure || err == nil {
+		if !request.cleanupOnFailure || err == nil {
 			return
 		}
 
-		if reportFailure != nil {
-			reportFailure(err)
+		if request.reportFailure != nil {
+			request.reportFailure(err)
 		}
-		c.bestEffortCloseUploadStream(teardownCtx, spaceID, tapeID, streamID)
+		c.bestEffortCloseUploadStream(request.teardownCtx, request.spaceID, request.tapeID, streamID)
 	}()
 	res, streamID, err = upload(streamID)
 	if err != nil {
 		return uploadResult{}, err
 	}
 
-	err = c.closeUploadStream(teardownCtx, spaceID, tapeID, streamID)
+	err = c.closeUploadStream(request.teardownCtx, request.spaceID, request.tapeID, streamID)
 	if err != nil {
 		return uploadResult{}, err
 	}
@@ -432,56 +403,40 @@ func (c *Client) uploadWithStream(ctx context.Context, teardownCtx context.Conte
 	return res, nil
 }
 
-func (c *Client) putChunkRecoveringFromDelete(
-	ctx context.Context,
-	teardownCtx context.Context,
-	retryCfg retryConfig,
-	spaceID string,
-	tapeID string,
-	streamID string,
-	seq int64,
-	raw []byte,
-	currentFormat payloadFormat,
-	ensureEncoder func() (zstdEncoder, error),
-	incarnationHasCommittedBytes bool,
-	idempotencyKey string,
-	cleanupOnFailure bool,
-	tapeOpts createTapeOptions,
-	reportFailure func(error),
-) (int64, string, payloadFormat, int64, int64, error) {
-	currentStreamID := streamID
-	format := currentFormat
+func (s *uploadSession) putChunk(raw []byte) (int64, int64, error) {
 	for {
-		nextSeq, uploadedChunks, uploadedBytes, ambiguousChunk, err := c.putRawChunkWithRetry(
-			ctx,
-			retryCfg,
-			spaceID,
-			tapeID,
-			currentStreamID,
-			seq,
+		nextSequence, uploadedChunks, uploadedBytes, ambiguousChunk, err := s.client.putRawChunkWithRetry(
+			s.request.ctx,
+			s.retryConfig,
+			s.request.spaceID,
+			s.request.tapeID,
+			s.streamID,
+			s.sequence,
 			raw,
-			format,
-			ensureEncoder,
+			s.format,
+			s.ensureEncoder,
 		)
 		if err == nil {
-			return nextSeq, currentStreamID, format, uploadedChunks, uploadedBytes, nil
+			s.sequence = nextSequence
+			s.incarnationCommittedBytes += uploadedBytes
+			return uploadedChunks, uploadedBytes, nil
 		}
 		if !isDeleteConflict(err) {
-			return nextSeq, currentStreamID, format, uploadedChunks, uploadedBytes, err
+			return uploadedChunks, uploadedBytes, err
 		}
-		if ambiguousChunk || incarnationHasCommittedBytes || uploadedBytes > 0 {
+		if ambiguousChunk || s.incarnationCommittedBytes > 0 || uploadedBytes > 0 {
 			// Once a transport error makes the current chunk's outcome
 			// ambiguous, or once any earlier bytes already committed in the
 			// current tape incarnation, replaying only the current chunk into a
 			// recreated tape would silently drop the committed prefix.
-			return nextSeq, currentStreamID, format, uploadedChunks, uploadedBytes, fmt.Errorf("cannot recover delete after committed bytes: %w", err)
+			return uploadedChunks, uploadedBytes, fmt.Errorf("cannot recover delete after committed bytes: %w", err)
 		}
 
-		currentStreamID, format, err = c.recreateDeletedTapeStream(ctx, teardownCtx, spaceID, tapeID, idempotencyKey, cleanupOnFailure, tapeOpts, reportFailure)
+		s.streamID, s.format, err = s.client.recreateDeletedTapeStream(s.request)
 		if err != nil {
-			return seq, currentStreamID, format, 0, 0, err
+			return 0, 0, err
 		}
-		seq = 0
+		s.sequence = 0
 	}
 }
 
@@ -510,28 +465,19 @@ func (c *Client) putRawChunkWithRetry(
 	}
 }
 
-func (c *Client) recreateDeletedTapeStream(
-	ctx context.Context,
-	teardownCtx context.Context,
-	spaceID string,
-	tapeID string,
-	idempotencyKey string,
-	cleanupOnFailure bool,
-	tapeOpts createTapeOptions,
-	reportFailure func(error),
-) (string, payloadFormat, error) {
-	_, format, err := c.createOrReuseAppendTape(ctx, spaceID, tapeID, tapeOpts)
+func (c *Client) recreateDeletedTapeStream(request uploadRequest) (string, payloadFormat, error) {
+	_, format, err := c.createOrReuseAppendTape(request.ctx, request.spaceID, request.tapeID, request.tapeOptions)
 	if err != nil {
 		return "", "", err
 	}
 
-	streamID, err := c.createStream(ctx, spaceID, tapeID, createStreamOptions{IdempotencyKey: idempotencyKey})
+	streamID, err := c.createStream(request.ctx, request.spaceID, request.tapeID, createStreamOptions{IdempotencyKey: request.idempotencyKey})
 	if err != nil {
-		if reportFailure != nil {
-			reportFailure(err)
+		if request.reportFailure != nil {
+			request.reportFailure(err)
 		}
-		if cleanupOnFailure {
-			c.bestEffortResolveAndCloseUploadStream(teardownCtx, spaceID, tapeID, idempotencyKey)
+		if request.cleanupOnFailure {
+			c.bestEffortResolveAndCloseUploadStream(request.teardownCtx, request.spaceID, request.tapeID, request.idempotencyKey)
 		}
 		return "", "", err
 	}
@@ -626,28 +572,33 @@ func putFramedZstdChunkWithRetry(ctx context.Context, cfg retryConfig, cli chunk
 		return seq, 0, 0, false, nil
 	}
 
-	frame := encodeFramedZstdChunk(raw, encoder)
-	sum := sha256.Sum256(frame)
-	shaHex := hex.EncodeToString(sum[:])
+	splitAt := defaultFramedZstdRawWindowBytes
+	ambiguousChunk := false
+	if len(raw) <= defaultFramedZstdRawWindowBytes {
+		frame := encodeFramedZstdChunk(raw, encoder)
+		sum := sha256.Sum256(frame)
+		shaHex := hex.EncodeToString(sum[:])
 
-	ambiguousChunk, err := putChunkWithRetry(ctx, cfg, cli, requestTimeout, spaceID, tapeID, streamID, seq, shaHex, frame)
-	if err == nil {
-		return seq + 1, 1, int64(len(raw)), ambiguousChunk, nil
-	} else if !shouldSplitChunk(err, len(frame)) || len(raw) <= 1 {
-		return seq, 0, 0, ambiguousChunk, err
+		var err error
+		ambiguousChunk, err = putChunkWithRetry(ctx, cfg, cli, requestTimeout, spaceID, tapeID, streamID, seq, shaHex, frame)
+		if err == nil {
+			return seq + 1, 1, int64(len(raw)), ambiguousChunk, nil
+		}
+		if !shouldSplitChunk(err, len(frame)) || len(raw) <= 1 {
+			return seq, 0, 0, ambiguousChunk, err
+		}
+		splitAt = len(raw) / 2
 	}
-	// Once the server proves the whole frame is too large to accept, the raw
-	// split path can continue without treating that impossible full-frame write
-	// as an ambiguous pre-delete commit.
+	// A proactive split has not sent the oversized raw window. A reactive split
+	// follows a concrete rejection, which proves the full frame did not commit.
 	ambiguousChunk = false
 
-	mid := len(raw) / 2
-	nextSeq, leftChunks, leftBytes, ambiguousLeft, err := putFramedZstdChunkWithRetry(ctx, cfg, cli, requestTimeout, spaceID, tapeID, streamID, seq, raw[:mid], encoder)
+	nextSeq, leftChunks, leftBytes, ambiguousLeft, err := putFramedZstdChunkWithRetry(ctx, cfg, cli, requestTimeout, spaceID, tapeID, streamID, seq, raw[:splitAt], encoder)
 	if err != nil {
 		return nextSeq, leftChunks, leftBytes, ambiguousChunk || ambiguousLeft, err
 	}
 
-	nextSeq, rightChunks, rightBytes, ambiguousRight, err := putFramedZstdChunkWithRetry(ctx, cfg, cli, requestTimeout, spaceID, tapeID, streamID, nextSeq, raw[mid:], encoder)
+	nextSeq, rightChunks, rightBytes, ambiguousRight, err := putFramedZstdChunkWithRetry(ctx, cfg, cli, requestTimeout, spaceID, tapeID, streamID, nextSeq, raw[splitAt:], encoder)
 	if err != nil {
 		return nextSeq, leftChunks + rightChunks, leftBytes + rightBytes, ambiguousChunk || ambiguousLeft || ambiguousRight, err
 	}
@@ -657,7 +608,7 @@ func putFramedZstdChunkWithRetry(ctx context.Context, cfg retryConfig, cli chunk
 
 type framedZstdUploadReader struct {
 	ctx           context.Context
-	source        io.Reader
+	source        io.ReadCloser
 	flushInterval time.Duration
 	requests      chan int
 	results       chan uploadReadResult
@@ -671,11 +622,9 @@ type uploadReadResult struct {
 	err     error
 }
 
-// newFramedZstdUploadReader batches plain reader bytes into one framed-zstd
-// raw chunk without reading ahead beyond the bytes the current chunk still
-// needs. This keeps generic live readers cancellable while preserving the
-// no-read-ahead guarantee the append path relies on after retry/delete fixes.
-func newFramedZstdUploadReader(ctx context.Context, r io.Reader, flushInterval time.Duration) *framedZstdUploadReader {
+// newFramedZstdUploadReader batches live source bytes without reading ahead
+// beyond the current chunk. Closing the wrapper interrupts the source read.
+func newFramedZstdUploadReader(ctx context.Context, r io.ReadCloser, flushInterval time.Duration) *framedZstdUploadReader {
 	return &framedZstdUploadReader{
 		ctx:           ctx,
 		source:        r,
@@ -742,16 +691,20 @@ func (r *framedZstdUploadReader) readLoop() {
 	}
 }
 
+// Close stops the read loop and closes its source.
 func (r *framedZstdUploadReader) Close() {
 	r.closeOnce.Do(func() {
 		close(r.done)
+		_ = r.source.Close()
 	})
 }
 
+// Read implements io.Reader.
 func (r *framedZstdUploadReader) Read(p []byte) (int, error) {
 	return r.ReadUploadChunk(p)
 }
 
+// ReadUploadChunk reads one flush-bounded raw chunk for framed compression.
 func (r *framedZstdUploadReader) ReadUploadChunk(p []byte) (int, error) {
 	r.start()
 	if len(p) == 0 {

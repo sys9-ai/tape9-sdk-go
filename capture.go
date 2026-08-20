@@ -117,6 +117,12 @@ func (c *Client) Capture(ctx context.Context, spaceID string, tapeID string, pro
 		return CaptureResult{}, err
 	}
 	spoolPath := spoolFile.Name()
+	spoolReader, err := os.Open(spoolPath)
+	if err != nil {
+		_ = spoolFile.Close()
+		_ = os.Remove(spoolPath)
+		return CaptureResult{}, err
+	}
 
 	doneWriting := make(chan struct{})
 	output := &procOutput{
@@ -132,6 +138,7 @@ func (c *Client) Capture(ctx context.Context, spaceID string, tapeID string, pro
 	}
 
 	if err := cmd.Start(); err != nil {
+		_ = spoolReader.Close()
 		_ = spoolFile.Close()
 		_ = os.Remove(spoolPath)
 
@@ -159,6 +166,7 @@ func (c *Client) Capture(ctx context.Context, spaceID string, tapeID string, pro
 	go func() {
 		defer close(uploadDone)
 		defer os.Remove(spoolPath)
+		defer spoolReader.Close()
 
 		gotTapeID, uploadFormat, err := c.createOrReuseAppendTape(ctx, spaceID, tapeID, createTapeOptions{
 			RetainMode:    opts.RetainMode,
@@ -175,18 +183,10 @@ func (c *Client) Capture(ctx context.Context, spaceID string, tapeID string, pro
 			return
 		}
 
-		r, err := os.Open(spoolPath)
-		if err != nil {
-			uploadState.mu.Lock()
-			uploadState.appendErr = err
-			uploadState.mu.Unlock()
-			return
-		}
-		defer r.Close()
 		close(spoolReady)
 
 		tr := &tailReader{
-			f:             r,
+			f:             spoolReader,
 			done:          doneWriting,
 			flushInterval: c.framedZstdUploadFlushInterval,
 			pollInterval:  pollInterval,
@@ -204,22 +204,22 @@ func (c *Client) Capture(ctx context.Context, spaceID string, tapeID string, pro
 			uploadState.mu.Unlock()
 		}
 
-		_, err = c.uploadWithPayloadFormat(
-			ctx,
-			context.Background(),
-			spaceID,
-			gotTapeID,
-			tr,
-			uploadFormat,
-			idempotencyKey,
-			cleanupOnFailure,
-			reportFailure,
-			createTapeOptions{
+		_, err = c.uploadWithPayloadFormat(uploadRequest{
+			ctx:              ctx,
+			teardownCtx:      context.Background(),
+			spaceID:          spaceID,
+			tapeID:           gotTapeID,
+			reader:           tr,
+			format:           uploadFormat,
+			idempotencyKey:   idempotencyKey,
+			cleanupOnFailure: cleanupOnFailure,
+			reportFailure:    reportFailure,
+			tapeOptions: createTapeOptions{
 				RetainMode:    opts.RetainMode,
 				PayloadFormat: selectedFormat,
 				UsageScope:    opts.UsageScope,
 			},
-		)
+		})
 		if err == nil {
 			return
 		}
@@ -366,6 +366,7 @@ type tailReader struct {
 
 // Read implements io.Reader by tailing the local spool file until writing is done.
 func (r *tailReader) Read(p []byte) (int, error) {
+	writingDone := false
 	for {
 		n, err := r.f.Read(p)
 		if n > 0 {
@@ -377,14 +378,20 @@ func (r *tailReader) Read(p []byte) (int, error) {
 		if !errors.Is(err, io.EOF) {
 			return 0, err
 		}
+		if writingDone {
+			return 0, io.EOF
+		}
 
 		select {
 		case <-r.done:
-			return 0, io.EOF
+			writingDone = true
+			continue
 		default:
 		}
 
-		time.Sleep(r.pollInterval)
+		if !r.waitForMore(r.pollInterval) {
+			writingDone = true
+		}
 	}
 }
 
@@ -392,6 +399,7 @@ func (r *tailReader) Read(p []byte) (int, error) {
 // one flush interval for more before sealing the current framed-zstd chunk.
 func (r *tailReader) ReadUploadChunk(p []byte) (int, error) {
 	var flushDeadline time.Time
+	writingDone := false
 	n := 0
 	for {
 		readN, err := r.f.Read(p[n:])
@@ -408,18 +416,21 @@ func (r *tailReader) ReadUploadChunk(p []byte) (int, error) {
 			}
 			return 0, err
 		}
+		if writingDone {
+			return n, io.EOF
+		}
 
 		select {
 		case <-r.done:
-			if n > 0 {
-				return n, io.EOF
-			}
-			return 0, io.EOF
+			writingDone = true
+			continue
 		default:
 		}
 
 		if n == 0 {
-			time.Sleep(r.pollInterval)
+			if !r.waitForMore(r.pollInterval) {
+				writingDone = true
+			}
 			continue
 		}
 		if flushDeadline.IsZero() {
@@ -434,6 +445,19 @@ func (r *tailReader) ReadUploadChunk(p []byte) (int, error) {
 		if wait <= 0 || wait > remaining {
 			wait = remaining
 		}
-		time.Sleep(wait)
+		if !r.waitForMore(wait) {
+			writingDone = true
+		}
+	}
+}
+
+func (r *tailReader) waitForMore(wait time.Duration) bool {
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case <-r.done:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
