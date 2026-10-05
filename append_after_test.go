@@ -3,13 +3,44 @@ package tape9
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"testing"
 )
+
+func TestAppendAfterGeneratedIDAcceptsLeadingDashEntropy(t *testing.T) {
+	// Raw URL-safe base64 starts with '-' for these bytes. Batch IDs must
+	// remain valid even though ordinary stream retry keys allow that prefix.
+	originalReader := rand.Reader
+	rand.Reader = bytes.NewReader(bytes.Repeat([]byte{0xf8}, 12))
+	t.Cleanup(func() { rand.Reader = originalReader })
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_, _ = io.WriteString(w, `{"tape_id":"tape-one"}`)
+			return
+		}
+		appendID := path.Base(r.URL.Path)
+		if !IsValidID(appendID) {
+			http.Error(w, "invalid append_id", http.StatusBadRequest)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"append_id": appendID})
+	}))
+	defer server.Close()
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := client.AppendAfter(context.Background(), "space-one", "tape-one", nil, AppendAfterOptions{})
+	if err != nil || !IsValidID(result.AppendID) {
+		t.Fatalf("generated batch identity must satisfy the server contract: result=%+v err=%v", result, err)
+	}
+}
 
 func TestAppendAfterConflictPreservesIdentityAndDoesNotFollowTail(t *testing.T) {
 	puts := 0

@@ -136,6 +136,8 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 		if err != nil {
 			return result, err
 		}
+		// Stream retry keys allow a leading '-', but Tape batch IDs do not.
+		result.AppendID = "batch_" + result.AppendID
 	}
 	_, format, err = c.createOrReuseAppendTape(ctx, spaceID, tapeID, createTapeOptions{
 		Conditional: true, RetainMode: opts.RetainMode, PayloadFormat: format, UsageScope: opts.UsageScope,
@@ -143,20 +145,21 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 	if err != nil {
 		return result, err
 	}
-	encoded := bytes.Clone(payload)
+	var encoded []byte
 	if format == payloadFormatFramedZstdV1 && len(payload) > 0 {
 		encoder, err := newFramedZstdEncoder()
 		if err != nil {
 			return result, err
 		}
 		defer encoder.Close()
-		encoded = nil
 		// Preserve the existing read format's bounded frames, but send all of
 		// them in one HTTP request and one commit, never separate appends.
 		for start := 0; start < len(payload); start += defaultFramedZstdRawWindowBytes {
 			end := min(start+defaultFramedZstdRawWindowBytes, len(payload))
 			encoded = append(encoded, encodeFramedZstdChunk(payload[start:end], encoder)...)
 		}
+	} else {
+		encoded = bytes.Clone(payload)
 	}
 	if len(encoded) > maxAppendAfterPayloadBytes {
 		return result, fmt.Errorf("conditional payload exceeds %d stored bytes", maxAppendAfterPayloadBytes)
