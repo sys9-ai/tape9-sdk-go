@@ -18,7 +18,8 @@ const maxAppendAfterPayloadBytes = MaxAppendAfterBytes + (64 << 10)
 
 // AppendAfterOptions defines one immutable batch and its required predecessor.
 type AppendAfterOptions struct {
-	// After is the previous successful AppendID; empty requires an empty Tape.
+	// After is the previous successful AppendID. Empty starts the conditional
+	// chain, even when the Tape already contains ordinary appended content.
 	After string
 	// AppendID is a unique, never-reused batch identity. Empty generates an ID
 	// once per call, returned even on error. Persist it with After and payload
@@ -60,11 +61,9 @@ func (e *AppendConflictError) Error() string {
 // Unwrap preserves the underlying HTTP response for transport diagnostics.
 func (e *AppendConflictError) Unwrap() error { return e.cause }
 
-// AppendState is the Tape's immutable write mode and latest accepted batch ID.
+// AppendState identifies the last successful conditional append, independently of ordinary writes.
 type AppendState struct {
-	// Conditional reports whether unconditional writes are forbidden.
-	Conditional bool `json:"conditional"`
-	// TailID is empty before the first batch and for ordinary Tapes.
+	// TailID is empty until the first successful AppendAfter, even on a nonempty Tape.
 	TailID string `json:"tail_id"`
 }
 
@@ -93,29 +92,30 @@ func (c *Client) AppendState(ctx context.Context, spaceID, tapeID string) (Appen
 			return readResponseError(resp)
 		}
 		var body struct {
-			Conditional *bool   `json:"conditional"`
-			TailID      *string `json:"tail_id"`
+			TailID *string `json:"tail_id"`
 		}
 		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 			return err
 		}
-		if body.Conditional == nil || body.TailID == nil || (*body.TailID != "" && (!*body.Conditional || !IsValidID(*body.TailID))) {
+		if body.TailID == nil || (*body.TailID != "" && !IsValidID(*body.TailID)) {
 			return fmt.Errorf("invalid append state response")
 		}
-		state = AppendState{Conditional: *body.Conditional, TailID: *body.TailID}
+		state = AppendState{TailID: *body.TailID}
 		return nil
 	})
 	return state, err
 }
 
 // AppendAfter atomically appends one finite batch after opts.After. A missing
-// Tape is created in conditional mode; existing ordinary Tapes are rejected.
+// Tape is created when needed; existing content is preserved. Ordinary Append
+// and Capture remain allowed and never check or change the conditional tail.
 //
 // Keep one unacknowledged batch per logical writer. An exact retry of the latest
 // batch succeeds; older retries conflict. Empty content still advances the tail.
 // All retries use the same ID, predecessor and encoded content. The SDK never
-// follows a conflicting tail, splits a batch, or recreates a deleted Tape.
-// Replacement histories must use new Tape IDs.
+// follows a conflicting tail or splits a batch. Once any AppendAfter succeeds,
+// the Tape ID cannot be reused after deletion; replacements need new Tape IDs.
+// Until then, ordinary delete/recreate semantics still apply.
 func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payload []byte, opts AppendAfterOptions) (AppendAfterResult, error) {
 	result := AppendAfterResult{TapeID: tapeID, AppendID: opts.AppendID, LogicalBytes: int64(len(payload))}
 	if !IsValidID(spaceID) || !IsValidID(tapeID) {
@@ -140,7 +140,7 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 		result.AppendID = "batch_" + result.AppendID
 	}
 	_, format, err = c.createOrReuseAppendTape(ctx, spaceID, tapeID, createTapeOptions{
-		Conditional: true, RetainMode: opts.RetainMode, PayloadFormat: format, UsageScope: opts.UsageScope,
+		RetainMode: opts.RetainMode, PayloadFormat: format, UsageScope: opts.UsageScope,
 	})
 	if err != nil {
 		return result, err

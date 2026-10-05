@@ -26,7 +26,9 @@ The SDK is available under the MIT License in [`LICENSE`](LICENSE).
 ## Conditional batches
 
 Use `AppendAfter` for a finite batch that must follow one exact previous batch.
-The first call creates a conditional Tape, which rejects ordinary streaming writes:
+It works on any Tape, including one with ordinary content. There is no write mode:
+ordinary `Append` and `Capture` stay allowed and never check or change the conditional
+tail. To order all content, your application must exclude ordinary writers.
 
 ```go
 result, err := client.AppendAfter(ctx, spaceID, tapeID, payload, tape9.AppendAfterOptions{
@@ -39,12 +41,17 @@ Persist a unique `pendingBatchID`, predecessor and immutable payload before send
 when recovery must survive process replacement. Keep one unacknowledged batch.
 An exact retry of the latest batch succeeds; older or changed batches return an
 `AppendConflictError` with `TailID`. Do not change the predecessor to bypass a
-conflict. `AppendState` reads mode and tail without reading content.
+conflict. `AppendState` reads the last conditional batch ID without reading content.
+An empty tail means no conditional batch has succeeded, not that the Tape is empty.
+Ordinary writes between conditional batches do not invalidate the latest retry.
 
 An omitted `AppendID` is generated once and returned in `result`, including on
 error. Only a nil error acknowledges acceptance. `AppendAfter` accepts at most
 32 MiB of raw bytes, never splits the atomic batch, and retries the same encoded
 request. Empty bytes still advance the batch identity. Compression uses the
 existing framed-zstd format; reads remain raw bytes. Retention never erases tail
-metadata. Deleted conditional Tape IDs cannot be reused: replacement history
-needs a new Tape ID. Ordinary `Append` and `Capture` remain unchanged.
+metadata. Once a conditional batch succeeds (even with empty bytes), its Tape ID
+cannot be reused after deletion: replacement history needs a new Tape ID. Before
+that first success, ordinary delete/recreate behavior remains, including for a
+failed first conditional request. A delayed empty-predecessor request can then
+reach the recreated Tape; applications own safe handoff from legacy writers.

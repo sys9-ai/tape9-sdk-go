@@ -47,10 +47,10 @@ func TestAppendAfterConflictPreservesIdentityAndDoesNotFollowTail(t *testing.T) 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			var create struct {
-				Conditional bool `json:"conditional"`
+				Conditional *bool `json:"conditional"`
 			}
-			if err := json.NewDecoder(r.Body).Decode(&create); err != nil || !create.Conditional {
-				t.Errorf("create must select conditional mode: %+v, %v", create, err)
+			if err := json.NewDecoder(r.Body).Decode(&create); err != nil || create.Conditional != nil {
+				t.Errorf("create must not select a write mode: %+v, %v", create, err)
 			}
 			_, _ = io.WriteString(w, `{"tape_id":"tape-one"}`)
 			return
@@ -134,25 +134,25 @@ func TestAppendAfterRejectsOversizeBeforeCreatingTape(t *testing.T) {
 	}
 }
 
-func TestAppendStateDistinguishesEmptyConditionalAndOrdinaryTape(t *testing.T) {
+func TestAppendStateReadsConditionalTail(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/v1/spaces/space-one/tapes/conditional/append-state" {
-			_, _ = io.WriteString(w, `{"conditional":true,"tail_id":""}`)
+		if r.URL.Path == "/v1/spaces/space-one/tapes/with-batch/append-state" {
+			_, _ = io.WriteString(w, `{"tail_id":"batch-one"}`)
 			return
 		}
-		_, _ = io.WriteString(w, `{"conditional":false,"tail_id":""}`)
+		_, _ = io.WriteString(w, `{"tail_id":""}`)
 	}))
 	defer server.Close()
 	client, err := New(server.URL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	conditional, err := client.AppendState(context.Background(), "space-one", "conditional")
-	if err != nil || !conditional.Conditional || conditional.TailID != "" {
-		t.Fatalf("conditional=%+v err=%v", conditional, err)
+	state, err := client.AppendState(context.Background(), "space-one", "with-batch")
+	if err != nil || state.TailID != "batch-one" {
+		t.Fatalf("state=%+v err=%v", state, err)
 	}
-	ordinary, err := client.AppendState(context.Background(), "space-one", "ordinary")
-	if err != nil || ordinary.Conditional || ordinary.TailID != "" {
-		t.Fatalf("ordinary=%+v err=%v", ordinary, err)
+	state, err = client.AppendState(context.Background(), "space-one", "ordinary")
+	if err != nil || state.TailID != "" {
+		t.Fatalf("state=%+v err=%v", state, err)
 	}
 }
