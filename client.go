@@ -102,6 +102,7 @@ func (c *Client) applySpaceSecret(req *http.Request) {
 }
 
 type createTapeOptions struct {
+	Conditional   bool
 	RetainMode    RetainMode
 	PayloadFormat payloadFormat
 	UsageScope    string
@@ -113,6 +114,7 @@ type createStreamOptions struct {
 
 func (c *Client) createTape(ctx context.Context, spaceID string, tapeID string, opts createTapeOptions) (string, error) {
 	type reqBody struct {
+		Conditional   bool   `json:"conditional,omitempty"`
 		TapeID        string `json:"tape_id,omitempty"`
 		RetainMode    string `json:"retain_mode,omitempty"`
 		PayloadFormat string `json:"payload_format,omitempty"`
@@ -135,8 +137,9 @@ func (c *Client) createTape(ctx context.Context, spaceID string, tapeID string, 
 
 	var body respBody
 	var bodyBytes []byte
-	if tapeID != "" || opts.RetainMode != "" || selectedFormat != payloadFormatIdentity || opts.UsageScope != "" {
+	if opts.Conditional || tapeID != "" || opts.RetainMode != "" || selectedFormat != payloadFormatIdentity || opts.UsageScope != "" {
 		b, err := json.Marshal(reqBody{
+			Conditional:   opts.Conditional,
 			TapeID:        tapeID,
 			RetainMode:    string(opts.RetainMode),
 			PayloadFormat: string(selectedFormat),
