@@ -258,17 +258,6 @@ func readUploadChunk(ctx context.Context, r io.Reader, format payloadFormat, buf
 	}
 }
 
-func uploadReadDone(format payloadFormat, err error) bool {
-	switch format {
-	case payloadFormatIdentity:
-		return errors.Is(err, io.EOF)
-	case payloadFormatFramedZstdV1:
-		return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
-	default:
-		return false
-	}
-}
-
 func (c *Client) uploadRawChunks(request uploadRequest) (res uploadResult, err error) {
 	maxChunkSize := defaultUploadChunkSizeBytes
 	if defaultFramedZstdRawWindowBytes > maxChunkSize {
@@ -359,7 +348,7 @@ func (c *Client) uploadRawChunks(request uploadRequest) (res uploadResult, err e
 				res.LogicalBytes += uploadedBytes
 			}
 
-			if uploadReadDone(readFormat, readErr) {
+			if errors.Is(readErr, io.EOF) {
 				return res, session.streamID, nil
 			}
 			if readErr != nil {

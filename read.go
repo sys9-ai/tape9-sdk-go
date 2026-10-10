@@ -59,6 +59,12 @@ type ReadMetrics struct {
 
 // ReadResult describes one successful read snapshot.
 type ReadResult struct {
+	// Closed reports that the tape no longer accepts new bytes.
+	Closed bool
+
+	// TotalBytes is the total stored byte count in the current tape incarnation.
+	TotalBytes int64
+
 	// RetainApplied reports whether the tape retain policy has hidden bytes from
 	// this snapshot.
 	RetainApplied bool
@@ -71,12 +77,15 @@ type ReadResult struct {
 }
 
 type contentPart struct {
+	Offset    int64  `json:"offset"`
 	ByteCount int64  `json:"byte_count"`
 	Source    string `json:"source"`
 	URL       string `json:"url"`
 }
 
 type contentResponse struct {
+	Closed        bool          `json:"closed"`
+	TotalBytes    int64         `json:"total_bytes"`
 	ResumeToken   string        `json:"resume_token"`
 	PayloadFormat string        `json:"payload_format"`
 	RetainApplied bool          `json:"retain_applied"`
@@ -124,6 +133,8 @@ func (c *Client) Read(ctx context.Context, spaceID string, tapeID string, w io.W
 	}
 
 	return ReadResult{
+		Closed:        pullResult.Closed,
+		TotalBytes:    pullResult.TotalBytes,
 		RetainApplied: pullResult.RetainApplied,
 		DroppedBytes:  pullResult.DroppedBytes,
 		Metrics:       pullResult.Metrics,

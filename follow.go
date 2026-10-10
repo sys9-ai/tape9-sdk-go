@@ -61,8 +61,10 @@ type FollowOptions struct {
 
 // Follow streams tape content to w according to opts.From, then keeps waiting
 // for later visible bytes and writes only the newly visible bytes until ctx is
-// cancelled. When AllowMissing is true, a missing space or tape starts from an
-// empty frontier and follow waits for later visible bytes instead of failing.
+// cancelled or the tape is closed. A closed response is fully written before
+// Follow returns successfully. When AllowMissing is true, a missing space or
+// tape starts from an empty frontier and follow waits for later visible bytes
+// instead of failing.
 func (c *Client) Follow(ctx context.Context, spaceID string, tapeID string, w io.Writer, opts FollowOptions) error {
 	if !IsValidID(spaceID) {
 		return fmt.Errorf("invalid space_id: %q", spaceID)
@@ -94,6 +96,10 @@ func (c *Client) Follow(ctx context.Context, spaceID string, tapeID string, w io
 		return err
 	}
 
+	if content.Closed {
+		return nil
+	}
+
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -109,6 +115,9 @@ func (c *Client) Follow(ctx context.Context, spaceID string, tapeID string, w io
 		resumeToken, err = c.writeContentParts(ctx, contentURL, content, false, w, 0, nil)
 		if err != nil {
 			return err
+		}
+		if content.Closed {
+			return nil
 		}
 	}
 }
@@ -222,6 +231,8 @@ func (c *Client) writeContentParts(ctx context.Context, contentURL *url.URL, con
 
 	if reportInitial && onInitial != nil {
 		onInitial(ReadResult{
+			Closed:        pullResult.Closed,
+			TotalBytes:    pullResult.TotalBytes,
 			RetainApplied: pullResult.RetainApplied,
 			DroppedBytes:  pullResult.DroppedBytes,
 			Metrics:       pullResult.Metrics,

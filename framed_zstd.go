@@ -12,6 +12,8 @@ import (
 const (
 	framedZstdHeaderSize            = 4
 	defaultFramedZstdRawWindowBytes = 7 * 512 * 1024
+	// Match the server's accepted decoded size for ordinary compressed chunks.
+	maxFramedZstdDecodedBytes = 64 * 1024 * 1024
 )
 
 type zstdEncoder interface {
@@ -27,7 +29,7 @@ func newFramedZstdEncoder() (*zstd.Encoder, error) {
 }
 
 func newFramedZstdDecoder() (*zstd.Decoder, error) {
-	return zstd.NewReader(nil, zstd.WithDecoderMaxMemory(defaultFramedZstdRawWindowBytes))
+	return zstd.NewReader(nil, zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxMemory(maxFramedZstdDecodedBytes))
 }
 
 func encodeFramedZstdChunk(raw []byte, encoder zstdEncoder) []byte {

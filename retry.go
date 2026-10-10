@@ -35,6 +35,7 @@ func (c *Client) doWithRetry(ctx context.Context, attempt func(context.Context) 
 
 func doWithRetry(ctx context.Context, cfg retryConfig, attempt func(context.Context) error) error {
 	retryStart := time.Time{}
+	var lastErr error
 	backoff := cfg.base
 
 	for {
@@ -43,11 +44,23 @@ func doWithRetry(ctx context.Context, cfg retryConfig, attempt func(context.Cont
 		}
 
 		attemptStarted := time.Now()
-		err := attempt(ctx)
+		attemptCtx := ctx
+		cancelAttempt := func() {}
+		// The first attempt keeps its normal request timeout. Later attempts
+		// cannot outlive the retry budget already consumed by failures and waits.
+		if !retryStart.IsZero() {
+			if !time.Now().Before(retryStart.Add(cfg.maxRetryTime)) {
+				return lastErr
+			}
+			attemptCtx, cancelAttempt = context.WithDeadline(ctx, retryStart.Add(cfg.maxRetryTime))
+		}
+		err := attempt(attemptCtx)
+		cancelAttempt()
 		if err == nil {
 			return nil
 		}
 
+		lastErr = err
 		retryAfter, ok := shouldRetry(err)
 		if !ok {
 			return err
@@ -118,7 +131,7 @@ func isTransportError(err error) bool {
 	if errors.As(err, &netErr) {
 		return true
 	}
-	return errors.Is(err, io.EOF)
+	return errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF)
 }
 
 func sleepContext(ctx context.Context, d time.Duration) error {

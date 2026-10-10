@@ -29,7 +29,7 @@ func TestParseCompression(t *testing.T) {
 	}
 }
 
-func TestFramedZstdRejectsDecodedChunkAboveRawWindow(t *testing.T) {
+func TestFramedZstdRejectsDecodedChunkAboveServerLimit(t *testing.T) {
 	encoder, err := newFramedZstdEncoder()
 	if err != nil {
 		t.Fatalf("new encoder: %v", err)
@@ -42,8 +42,29 @@ func TestFramedZstdRejectsDecodedChunkAboveRawWindow(t *testing.T) {
 	}
 	defer decoder.Close()
 
-	framed := encodeFramedZstdChunk(bytes.Repeat([]byte("a"), defaultFramedZstdRawWindowBytes+1), encoder)
+	framed := encodeFramedZstdChunk(bytes.Repeat([]byte("a"), maxFramedZstdDecodedBytes+1), encoder)
 	if err := decodeFramedZstdSegment(framed, decoder, io.Discard); err == nil {
 		t.Fatal("decode oversized chunk succeeded")
+	}
+}
+
+func TestFramedZstdAcceptsServerCompatibleLargeDecodedRecord(t *testing.T) {
+	encoder, err := newFramedZstdEncoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer encoder.Close()
+	decoder, err := newFramedZstdDecoder()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer decoder.Close()
+	raw := bytes.Repeat([]byte("a"), 4*1024*1024)
+	var out bytes.Buffer
+	if err := decodeFramedZstdSegment(encodeFramedZstdChunk(raw, encoder), decoder, &out); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(out.Bytes(), raw) {
+		t.Fatal("decoded content differs")
 	}
 }

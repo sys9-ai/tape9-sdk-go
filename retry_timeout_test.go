@@ -3,6 +3,7 @@ package tape9
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -214,5 +215,56 @@ func noContentResponse() *http.Response {
 		Header:     make(http.Header),
 		Body:       io.NopCloser(strings.NewReader("")),
 		Request:    &http.Request{},
+	}
+}
+
+func TestClientAppendCompressedPreservesUnexpectedSourceEOF(t *testing.T) {
+	for _, closeable := range []bool{false, true} {
+		t.Run(fmt.Sprint(closeable), func(t *testing.T) {
+			transport := &timeoutRetryTransport{t: t}
+			client, err := New("http://example.com", WithHTTPClient(&http.Client{Transport: transport}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var source io.Reader = &readerErrorAfterData{payload: []byte("partial"), err: io.ErrUnexpectedEOF}
+			if closeable {
+				source = io.NopCloser(source)
+			}
+			_, err = client.Append(context.Background(), "space", "tape", source, AppendOptions{Compression: CompressionZstd})
+			if !errors.Is(err, io.ErrUnexpectedEOF) {
+				t.Fatalf("append error = %v, want unexpected EOF", err)
+			}
+			if transport.chunkCalls != 1 {
+				t.Fatalf("chunk calls = %d, want 1", transport.chunkCalls)
+			}
+			if transport.closeCalls != 1 {
+				t.Fatalf("close calls = %d, want 1", transport.closeCalls)
+			}
+		})
+	}
+}
+
+func TestRetryUnexpectedEOFAndBoundSubsequentAttempt(t *testing.T) {
+	attempts := 0
+	started := time.Now()
+	err := doWithRetry(context.Background(), retryConfig{base: time.Millisecond, max: time.Millisecond, maxRetryTime: 30 * time.Millisecond}, func(ctx context.Context) error {
+		attempts++
+		if attempts == 1 {
+			return io.ErrUnexpectedEOF
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("retry attempt has no budget deadline")
+		}
+		<-ctx.Done()
+		return ctx.Err()
+	})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error = %v", err)
+	}
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+	if time.Since(started) > time.Second {
+		t.Fatal("retry exceeded budget")
 	}
 }

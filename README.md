@@ -19,7 +19,9 @@ go doc github.com/sys9-ai/tape9-sdk-go
 ```
 
 Create a client with `tape9.New`, then use `Append`, `Read`, `Pull`, or `Follow`
-against a space and tape. See the package examples for complete call shapes.
+against a space and tape. `CloseTape` stops future writes while keeping existing
+content readable. `Read` and `Pull` report `Closed` and the incarnation's stored
+`TotalBytes`; `Follow` writes the final content and returns when the tape closes. See the package examples for complete call shapes.
 
 The SDK is available under the MIT License in [`LICENSE`](LICENSE).
 

@@ -134,6 +134,13 @@ type PullOptions struct {
 
 // PullResult describes one caller-managed pull result.
 type PullResult struct {
+	// Closed reports that the tape no longer accepts new bytes.
+	Closed bool
+
+	// TotalBytes is the total stored byte count in the current tape incarnation.
+	// It is unavailable when NoChange is true.
+	TotalBytes int64
+
 	// ResumeToken is the opaque cursor that represents the visible content after
 	// this pull result. Persist it and feed it into the next Pull call.
 	ResumeToken ResumeToken
@@ -285,6 +292,8 @@ func (c *Client) pullContent(ctx context.Context, contentURL *url.URL, content c
 
 	return PullResult{
 		ResumeToken:   ResumeToken{raw: content.ResumeToken},
+		Closed:        content.Closed,
+		TotalBytes:    content.TotalBytes,
 		RetainApplied: content.RetainApplied,
 		DroppedBytes:  content.DroppedBytes,
 		Metrics:       metrics,
