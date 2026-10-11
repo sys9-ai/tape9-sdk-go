@@ -77,7 +77,6 @@ type ReadResult struct {
 }
 
 type contentPart struct {
-	Offset    int64  `json:"offset"`
 	ByteCount int64  `json:"byte_count"`
 	Source    string `json:"source"`
 	URL       string `json:"url"`
