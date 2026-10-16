@@ -210,9 +210,21 @@ func existingPayloadFormatConflict(err error) (payloadFormat, bool) {
 	return format, true
 }
 
-func isDeleteConflict(err error) bool {
-	message, ok := httpAPIErrorMessage(err, http.StatusConflict)
-	return ok && message == "tape deleted"
+func isUploadStreamInvalidated(err error) bool {
+	var httpErr *HTTPError
+	if !errors.As(err, &httpErr) {
+		return false
+	}
+	// A missing Stream is expected after delete/recreate. Only the structured
+	// API error is evidence of this; a proxy's 404 must remain an error.
+	var body struct {
+		Error string `json:"error"`
+	}
+	if json.Unmarshal([]byte(httpErr.Body), &body) != nil {
+		return false
+	}
+	return (httpErr.StatusCode == http.StatusConflict && body.Error == "tape deleted") ||
+		(httpErr.StatusCode == http.StatusNotFound && body.Error == "stream not found")
 }
 
 func (c *Client) uploadWithPayloadFormat(request uploadRequest) (uploadResult, error) {
@@ -410,7 +422,7 @@ func (s *uploadSession) putChunk(raw []byte) (int64, int64, error) {
 			s.incarnationCommittedBytes += uploadedBytes
 			return uploadedChunks, uploadedBytes, nil
 		}
-		if !isDeleteConflict(err) {
+		if !isUploadStreamInvalidated(err) {
 			return uploadedChunks, uploadedBytes, err
 		}
 		if ambiguousChunk || s.incarnationCommittedBytes > 0 || uploadedBytes > 0 {
@@ -418,7 +430,7 @@ func (s *uploadSession) putChunk(raw []byte) (int64, int64, error) {
 			// ambiguous, or once any earlier bytes already committed in the
 			// current tape incarnation, replaying only the current chunk into a
 			// recreated tape would silently drop the committed prefix.
-			return uploadedChunks, uploadedBytes, fmt.Errorf("cannot recover delete after committed bytes: %w", err)
+			return uploadedChunks, uploadedBytes, fmt.Errorf("cannot recover invalidated stream after committed or ambiguous bytes: %w", err)
 		}
 
 		s.streamID, s.format, err = s.client.recreateDeletedTapeStream(s.request)

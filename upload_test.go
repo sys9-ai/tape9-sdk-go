@@ -586,7 +586,7 @@ func TestClientAppendDeleteRecoverySwitchesToFramedZstdReader(t *testing.T) {
 	}
 }
 
-func TestClientAppendRecoversCurrentChunkAfterDeleteConflict(t *testing.T) {
+func TestClientAppendRecoversCurrentChunkAfterMissingStream(t *testing.T) {
 	var (
 		createTapeCalls   int
 		createStreamCalls int
@@ -640,9 +640,9 @@ func TestClientAppendRecoversCurrentChunkAfterDeleteConflict(t *testing.T) {
 			chunks = append(chunks, body)
 			switch r.URL.Path {
 			case "/v1/spaces/space/tapes/tape/streams/stream-1/chunks/0":
-				w.WriteHeader(http.StatusConflict)
+				w.WriteHeader(http.StatusNotFound)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"error":"tape deleted"}`)
+				_, _ = io.WriteString(w, `{"error":"stream not found"}`)
 			case "/v1/spaces/space/tapes/tape/streams/stream-2/chunks/0":
 				w.WriteHeader(http.StatusNoContent)
 			case "/v1/spaces/space/tapes/tape/streams/stream-2/chunks/1":
@@ -799,7 +799,7 @@ func TestClientAppendFailsDeleteRecoveryAfterCommittedPrefix(t *testing.T) {
 	if err == nil {
 		t.Fatal("append succeeded after delete removed an already committed prefix, want error")
 	}
-	if !strings.Contains(err.Error(), "cannot recover delete after committed bytes") {
+	if !strings.Contains(err.Error(), "cannot recover invalidated stream after committed or ambiguous bytes") {
 		t.Fatalf("append error = %v, want committed-prefix delete-recovery error", err)
 	}
 	if got, want := createTapeCalls, 1; got != want {
@@ -833,7 +833,7 @@ func TestClientAppendFailsDeleteRecoveryAfterCommittedPrefix(t *testing.T) {
 	}
 }
 
-func TestClientAppendFailsDeleteRecoveryAfterCommittedSplitPrefix(t *testing.T) {
+func TestClientAppendFailsMissingStreamRecoveryAfterCommittedSplitPrefix(t *testing.T) {
 	var (
 		createTapeCalls   int
 		createStreamCalls int
@@ -871,9 +871,9 @@ func TestClientAppendFailsDeleteRecoveryAfterCommittedSplitPrefix(t *testing.T) 
 			case 2:
 				w.WriteHeader(http.StatusNoContent)
 			case 3:
-				w.WriteHeader(http.StatusConflict)
+				w.WriteHeader(http.StatusNotFound)
 				w.Header().Set("Content-Type", "application/json")
-				_, _ = io.WriteString(w, `{"error":"tape deleted"}`)
+				_, _ = io.WriteString(w, `{"error":"stream not found"}`)
 			default:
 				http.NotFound(w, r)
 			}
@@ -895,7 +895,7 @@ func TestClientAppendFailsDeleteRecoveryAfterCommittedSplitPrefix(t *testing.T) 
 	if err == nil {
 		t.Fatal("append succeeded after delete removed a committed split prefix, want error")
 	}
-	if !strings.Contains(err.Error(), "cannot recover delete after committed bytes") {
+	if !strings.Contains(err.Error(), "cannot recover invalidated stream after committed or ambiguous bytes") {
 		t.Fatalf("append error = %v, want committed-split-prefix delete-recovery error", err)
 	}
 	if got, want := createTapeCalls, 1; got != want {
@@ -927,7 +927,7 @@ func TestClientAppendFailsDeleteRecoveryAfterCommittedSplitPrefix(t *testing.T) 
 	}
 }
 
-func TestClientAppendStopsDeleteRecoveryAfterAmbiguousChunkCommit(t *testing.T) {
+func TestClientAppendStopsMissingStreamRecoveryAfterAmbiguousChunkCommit(t *testing.T) {
 	var (
 		createTapeCalls   int
 		createStreamCalls int
@@ -964,9 +964,9 @@ func TestClientAppendStopsDeleteRecoveryAfterAmbiguousChunkCommit(t *testing.T) 
 				<-r.Context().Done()
 				return
 			}
-			w.WriteHeader(http.StatusConflict)
+			w.WriteHeader(http.StatusNotFound)
 			w.Header().Set("Content-Type", "application/json")
-			_, _ = io.WriteString(w, `{"error":"tape deleted"}`)
+			_, _ = io.WriteString(w, `{"error":"stream not found"}`)
 		case r.Method == http.MethodPut && r.URL.Path == "/v1/spaces/space/tapes/tape/streams/stream-2/chunks/0":
 			body, err := io.ReadAll(r.Body)
 			if err != nil {
@@ -999,8 +999,8 @@ func TestClientAppendStopsDeleteRecoveryAfterAmbiguousChunkCommit(t *testing.T) 
 	if err == nil {
 		t.Fatal("append succeeded after ambiguous chunk commit and delete conflict, want error")
 	}
-	if !strings.Contains(err.Error(), "tape deleted") {
-		t.Fatalf("append error = %v, want tape deleted context", err)
+	if !strings.Contains(err.Error(), "stream not found") {
+		t.Fatalf("append error = %v, want stream not found context", err)
 	}
 	if got, want := createTapeCalls, 1; got != want {
 		t.Fatalf("create tape calls = %d, want %d", got, want)
@@ -1075,7 +1075,7 @@ func TestPutChunkWithSplitRetryClearsAmbiguityAfterPayloadTooLargeProof(t *testi
 	if err == nil {
 		t.Fatal("expected delete conflict")
 	}
-	if !isDeleteConflict(err) {
+	if !isUploadStreamInvalidated(err) {
 		t.Fatalf("expected delete conflict, got %v", err)
 	}
 	if ambiguous {
@@ -1124,7 +1124,7 @@ func TestPutFramedZstdChunkWithRetryClearsAmbiguityAfterPayloadTooLargeProof(t *
 			case 3:
 				return nil
 			case 4:
-				return &HTTPError{StatusCode: http.StatusConflict, Body: `{"error":"tape deleted"}`}
+				return &HTTPError{StatusCode: http.StatusNotFound, Body: `{"error":"stream not found"}`}
 			default:
 				t.Fatalf("unexpected putChunk call %d", len(calls))
 				return nil
@@ -1153,7 +1153,7 @@ func TestPutFramedZstdChunkWithRetryClearsAmbiguityAfterPayloadTooLargeProof(t *
 	if err == nil {
 		t.Fatal("expected delete conflict")
 	}
-	if !isDeleteConflict(err) {
+	if !isUploadStreamInvalidated(err) {
 		t.Fatalf("expected delete conflict, got %v", err)
 	}
 	if ambiguous {
@@ -2388,4 +2388,30 @@ func (tr *closeAfterContextExpiryTransport) RoundTrip(req *http.Request) (*http.
 
 	tr.t.Fatalf("unexpected request: %s %s", req.Method, req.URL.Path)
 	return nil, errors.New("unexpected request")
+}
+
+func TestUploadStreamInvalidationRequiresExactAPIError(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{name: "deleted tape", err: &HTTPError{StatusCode: 409, Body: `{"error":"tape deleted"}`}, want: true},
+		{name: "missing stream", err: &HTTPError{StatusCode: 404, Body: `{"error":"stream not found"}`}, want: true},
+		{name: "missing tape", err: &HTTPError{StatusCode: 404, Body: `{"error":"tape not found"}`}},
+		{name: "closed stream", err: &HTTPError{StatusCode: 409, Body: `{"error":"stream is closed"}`}},
+		{name: "wrong status", err: &HTTPError{StatusCode: 403, Body: `{"error":"stream not found"}`}},
+		{name: "proxy error", err: &HTTPError{StatusCode: 404, Body: "404 page not found"}},
+		{name: "plain text", err: &HTTPError{StatusCode: 404, Body: "stream not found"}},
+		{name: "malformed json", err: &HTTPError{StatusCode: 404, Body: `{"error":"stream not found"`}},
+		{name: "transport error", err: io.EOF},
+		{name: "no error"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := isUploadStreamInvalidated(test.err); got != test.want {
+				t.Fatalf("isUploadStreamInvalidated(%v) = %v, want %v", test.err, got, test.want)
+			}
+		})
+	}
 }

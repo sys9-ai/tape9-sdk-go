@@ -57,3 +57,11 @@ cannot be reused after deletion: replacement history needs a new Tape ID. Before
 that first success, ordinary delete/recreate behavior remains, including for a
 failed first conditional request. A delayed empty-predecessor request can then
 reach the recreated Tape; applications own safe handoff from legacy writers.
+
+## Uploads across Tape deletion
+
+Deleting a Tape discards its internal upload sessions. Append and Capture can
+recover a deleted or missing session only before the current call has committed
+bytes and while the current chunk has an unambiguous outcome. Otherwise they
+surface the upload error rather than replaying a truncated suffix. Closed
+sessions on an undeleted Tape remain replayable with the same idempotency key.

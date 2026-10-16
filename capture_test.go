@@ -359,7 +359,7 @@ func TestClientCaptureFallsBackToExistingIdentityTapeFormat(t *testing.T) {
 	}
 }
 
-func TestClientCaptureFailsDeleteRecoveryAfterCommittedPrefix(t *testing.T) {
+func TestClientCaptureFailsMissingStreamRecoveryAfterCommittedPrefix(t *testing.T) {
 	var (
 		createTapeCalls   int
 		createStreamCalls int
@@ -401,8 +401,8 @@ func TestClientCaptureFailsDeleteRecoveryAfterCommittedPrefix(t *testing.T) {
 				w.WriteHeader(http.StatusNoContent)
 			case "/v1/spaces/space/tapes/tape-1/streams/stream-1/chunks/1":
 				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusConflict)
-				_, _ = io.WriteString(w, `{"error":"tape deleted"}`)
+				w.WriteHeader(http.StatusNotFound)
+				_, _ = io.WriteString(w, `{"error":"stream not found"}`)
 			case "/v1/spaces/space/tapes/tape-1/streams/stream-2/chunks/0":
 				w.WriteHeader(http.StatusNoContent)
 			default:
@@ -437,7 +437,7 @@ func TestClientCaptureFailsDeleteRecoveryAfterCommittedPrefix(t *testing.T) {
 	if res.AppendErr == nil {
 		t.Fatal("expected append err after delete removed an already committed prefix")
 	}
-	if !strings.Contains(res.AppendErr.Error(), "cannot recover delete after committed bytes") {
+	if !strings.Contains(res.AppendErr.Error(), "cannot recover invalidated stream after committed or ambiguous bytes") {
 		t.Fatalf("append err = %v, want committed-prefix delete-recovery error", res.AppendErr)
 	}
 	if got, want := createTapeCalls, 1; got != want {
