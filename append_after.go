@@ -131,6 +131,12 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 	if err != nil {
 		return result, err
 	}
+	tapeOptions := createTapeOptions{
+		RetainMode: opts.RetainMode, PayloadFormat: format, UsageScope: opts.UsageScope,
+	}
+	if err := tapeOptions.validate(); err != nil {
+		return result, err
+	}
 	if result.AppendID == "" {
 		result.AppendID, err = NewIdempotencyKey()
 		if err != nil {
@@ -143,23 +149,23 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 	// A Tape that accepted an AppendAfter can never be recreated, so its
 	// format stays valid until the Tape disappears from the server entirely.
 	key := spaceID + "\x00" + tapeID
-	if pinned, ok := c.pinnedTapes.Get(key); ok {
-		err = c.putAppendAfter(ctx, spaceID, tapeID, payload, opts.After, result.AppendID, pinned)
+	// A nonempty scope must be bound or checked by create/reuse unless an
+	// earlier successful call already confirmed that immutable scope.
+	if pinned, ok := c.pinnedTapes.Get(key); ok && (opts.UsageScope == "" || opts.UsageScope == pinned.usageScope) {
+		err = c.putAppendAfter(ctx, spaceID, tapeID, payload, opts.After, result.AppendID, pinned.format)
 		// Only the API's own 404 proves the Tape is gone; a proxy's 404 stays an error.
 		if message, ok := httpAPIErrorMessage(err, http.StatusNotFound); !ok || (message != "tape not found" && message != "space not found") {
 			return result, err
 		}
 		c.pinnedTapes.Remove(key)
 	}
-	_, format, err = c.createOrReuseAppendTape(ctx, spaceID, tapeID, createTapeOptions{
-		RetainMode: opts.RetainMode, PayloadFormat: format, UsageScope: opts.UsageScope,
-	})
+	_, format, err = c.createOrReuseAppendTape(ctx, spaceID, tapeID, tapeOptions)
 	if err != nil {
 		return result, err
 	}
 	err = c.putAppendAfter(ctx, spaceID, tapeID, payload, opts.After, result.AppendID, format)
 	if err == nil {
-		c.pinnedTapes.Add(key, format)
+		c.pinnedTapes.Add(key, pinnedTape{format: format, usageScope: opts.UsageScope})
 	}
 	return result, err
 }

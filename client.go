@@ -27,9 +27,15 @@ type Client struct {
 	retryMax                      time.Duration
 	maxRetryTime                  time.Duration
 	framedZstdUploadFlushInterval time.Duration
-	// pinnedTapes remembers the payload format of Tapes that accepted an
-	// AppendAfter, so later batches need no create/reuse round trip.
-	pinnedTapes *lru.Cache[string, payloadFormat]
+	// pinnedTapes remembers immutable properties confirmed for Tapes that
+	// accepted an AppendAfter, avoiding repeated create/reuse requests.
+	pinnedTapes *lru.Cache[string, pinnedTape]
+}
+
+type pinnedTape struct {
+	format payloadFormat
+	// Empty means no scope was confirmed, not that the Tape is unscoped.
+	usageScope string
 }
 
 // pinnedTapeCacheSize bounds remembered Tapes; an evicted Tape costs one
@@ -64,7 +70,7 @@ func New(endpoint string, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("invalid max retry time: %s", cfg.maxRetryTime)
 	}
 
-	pinnedTapes, err := lru.New[string, payloadFormat](pinnedTapeCacheSize)
+	pinnedTapes, err := lru.New[string, pinnedTape](pinnedTapeCacheSize)
 	if err != nil {
 		return nil, err
 	}
@@ -122,6 +128,19 @@ type createTapeOptions struct {
 	UsageScope    string
 }
 
+func (opts createTapeOptions) validate() error {
+	if opts.RetainMode != "" && !opts.RetainMode.IsValid() {
+		return fmt.Errorf("invalid retain mode: %q", opts.RetainMode)
+	}
+	if opts.PayloadFormat != "" && !opts.PayloadFormat.isValid() {
+		return fmt.Errorf("invalid payload format: %q", opts.PayloadFormat)
+	}
+	if opts.UsageScope != "" && !IsValidID(opts.UsageScope) {
+		return fmt.Errorf("invalid usage_scope: %q", opts.UsageScope)
+	}
+	return nil
+}
+
 type createStreamOptions struct {
 	IdempotencyKey string
 }
@@ -137,14 +156,8 @@ func (c *Client) createTape(ctx context.Context, spaceID string, tapeID string, 
 		TapeID string `json:"tape_id"`
 	}
 
-	if opts.RetainMode != "" && !opts.RetainMode.IsValid() {
-		return "", fmt.Errorf("invalid retain mode: %q", opts.RetainMode)
-	}
-	if opts.PayloadFormat != "" && !opts.PayloadFormat.isValid() {
-		return "", fmt.Errorf("invalid payload format: %q", opts.PayloadFormat)
-	}
-	if opts.UsageScope != "" && !IsValidID(opts.UsageScope) {
-		return "", fmt.Errorf("invalid usage_scope: %q", opts.UsageScope)
+	if err := opts.validate(); err != nil {
+		return "", err
 	}
 	selectedFormat := opts.PayloadFormat.orDefault()
 

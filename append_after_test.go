@@ -202,3 +202,152 @@ func TestAppendAfterCreatesTapeOnlyUntilABatchIsAccepted(t *testing.T) {
 		t.Fatalf("a missing pinned Tape must be recreated once: creates=%d puts=%d", creates, puts)
 	}
 }
+
+func TestAppendAfterBindsLateUsageScopeAndRejectsConflicts(t *testing.T) {
+	var creates, puts int
+	var scope string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			creates++
+			var request struct {
+				UsageScope string `json:"usage_scope"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if scope != "" && request.UsageScope != "" && scope != request.UsageScope {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(w, `{"error":"usage_scope conflict"}`)
+				return
+			}
+			if scope == "" {
+				scope = request.UsageScope
+			}
+			_, _ = io.WriteString(w, `{"tape_id":"tape-one"}`)
+			return
+		}
+		puts++
+		_ = json.NewEncoder(w).Encode(map[string]string{"append_id": path.Base(r.URL.Path)})
+	}))
+	defer server.Close()
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	appendBatch := func(after, id, usageScope string) error {
+		_, err := client.AppendAfter(context.Background(), "space-one", "tape-one", []byte(id),
+			AppendAfterOptions{After: after, AppendID: id, UsageScope: usageScope})
+		return err
+	}
+	if err := appendBatch("", "batch-1", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendBatch("batch-1", "batch-2", "scope-one"); err != nil {
+		t.Fatal(err)
+	}
+	if scope != "scope-one" || creates != 2 || puts != 2 {
+		t.Fatalf("late scope must be bound before append: scope=%q creates=%d puts=%d", scope, creates, puts)
+	}
+	if err := appendBatch("batch-2", "batch-3", "scope-one"); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendBatch("batch-3", "batch-4", ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := appendBatch("batch-4", "batch-5", "scope-one"); err != nil {
+		t.Fatal(err)
+	}
+	if creates != 2 || puts != 5 {
+		t.Fatalf("confirmed scope must avoid repeated create/reuse: creates=%d puts=%d", creates, puts)
+	}
+	err = appendBatch("batch-5", "batch-6", "scope-other")
+	if message, ok := httpAPIErrorMessage(err, http.StatusConflict); !ok || message != "usage_scope conflict" {
+		t.Fatalf("expected scope conflict, got %v", err)
+	}
+	if creates != 3 || puts != 5 {
+		t.Fatalf("scope conflict must prevent append: creates=%d puts=%d", creates, puts)
+	}
+}
+
+func TestAppendAfterDoesNotInferExistingScopeFromUnscopedRequest(t *testing.T) {
+	var creates, puts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			creates++
+			var request struct {
+				UsageScope string `json:"usage_scope"`
+			}
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Error(err)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			// This Tape was already bound by another client before our first append.
+			if request.UsageScope != "" && request.UsageScope != "existing-scope" {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = io.WriteString(w, `{"error":"usage_scope conflict"}`)
+				return
+			}
+			_, _ = io.WriteString(w, `{"tape_id":"tape-one"}`)
+			return
+		}
+		puts++
+		_ = json.NewEncoder(w).Encode(map[string]string{"append_id": path.Base(r.URL.Path)})
+	}))
+	defer server.Close()
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.AppendAfter(context.Background(), "space-one", "tape-one", nil, AppendAfterOptions{AppendID: "batch-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.AppendAfter(context.Background(), "space-one", "tape-one", nil,
+		AppendAfterOptions{After: "batch-1", AppendID: "batch-2", UsageScope: "different-scope"})
+	if message, ok := httpAPIErrorMessage(err, http.StatusConflict); !ok || message != "usage_scope conflict" {
+		t.Fatalf("expected existing scope conflict, got %v", err)
+	}
+	if creates != 2 || puts != 1 {
+		t.Fatalf("unknown scope must be checked before append: creates=%d puts=%d", creates, puts)
+	}
+}
+
+func TestAppendAfterValidatesOptionsOnPinnedTape(t *testing.T) {
+	requests := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		if r.Method == http.MethodPost {
+			_, _ = io.WriteString(w, `{"tape_id":"tape-one"}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"append_id": path.Base(r.URL.Path)})
+	}))
+	defer server.Close()
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = client.AppendAfter(context.Background(), "space-one", "tape-one", nil, AppendAfterOptions{AppendID: "batch-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, options := range map[string]AppendAfterOptions{
+		"retain":      {RetainMode: RetainMode("invalid")},
+		"scope":       {UsageScope: "invalid scope"},
+		"compression": {Compression: Compression("invalid")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			options.After = "batch-1"
+			options.AppendID = "batch-2"
+			if _, err := client.AppendAfter(context.Background(), "space-one", "tape-one", nil, options); err == nil {
+				t.Fatal("invalid option must fail on a pinned Tape")
+			}
+			if requests != 2 {
+				t.Fatalf("invalid option must send no request: requests=%d", requests)
+			}
+		})
+	}
+}
