@@ -139,17 +139,38 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 		// Stream retry keys allow a leading '-', but Tape batch IDs do not.
 		result.AppendID = "batch_" + result.AppendID
 	}
+
+	// A Tape that accepted an AppendAfter can never be recreated, so its
+	// format stays valid until the Tape disappears from the server entirely.
+	key := spaceID + "\x00" + tapeID
+	if pinned, ok := c.pinnedTapes.Get(key); ok {
+		err = c.putAppendAfter(ctx, spaceID, tapeID, payload, opts.After, result.AppendID, pinned)
+		// Only the API's own 404 proves the Tape is gone; a proxy's 404 stays an error.
+		if message, ok := httpAPIErrorMessage(err, http.StatusNotFound); !ok || (message != "tape not found" && message != "space not found") {
+			return result, err
+		}
+		c.pinnedTapes.Remove(key)
+	}
 	_, format, err = c.createOrReuseAppendTape(ctx, spaceID, tapeID, createTapeOptions{
 		RetainMode: opts.RetainMode, PayloadFormat: format, UsageScope: opts.UsageScope,
 	})
 	if err != nil {
 		return result, err
 	}
+	err = c.putAppendAfter(ctx, spaceID, tapeID, payload, opts.After, result.AppendID, format)
+	if err == nil {
+		c.pinnedTapes.Add(key, format)
+	}
+	return result, err
+}
+
+// putAppendAfter sends one encoded batch to an existing Tape.
+func (c *Client) putAppendAfter(ctx context.Context, spaceID, tapeID string, payload []byte, after, appendID string, format payloadFormat) error {
 	var encoded []byte
 	if format == payloadFormatFramedZstdV1 && len(payload) > 0 {
 		encoder, err := newFramedZstdEncoder()
 		if err != nil {
-			return result, err
+			return err
 		}
 		defer encoder.Close()
 		// Preserve the existing read format's bounded frames, but send all of
@@ -162,18 +183,18 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 		encoded = bytes.Clone(payload)
 	}
 	if len(encoded) > maxAppendAfterPayloadBytes {
-		return result, fmt.Errorf("conditional payload exceeds %d stored bytes", maxAppendAfterPayloadBytes)
+		return fmt.Errorf("conditional payload exceeds %d stored bytes", maxAppendAfterPayloadBytes)
 	}
-	err = c.doWithRetry(ctx, func(attemptCtx context.Context) error {
+	err := c.doWithRetry(ctx, func(attemptCtx context.Context) error {
 		attemptCtx, cancel := context.WithTimeout(attemptCtx, c.requestTimeout)
 		defer cancel()
 		req, err := http.NewRequestWithContext(attemptCtx, http.MethodPut,
-			c.endpointURL("v1", "spaces", url.PathEscape(spaceID), "tapes", url.PathEscape(tapeID), "appends", url.PathEscape(result.AppendID)), bytes.NewReader(encoded))
+			c.endpointURL("v1", "spaces", url.PathEscape(spaceID), "tapes", url.PathEscape(tapeID), "appends", url.PathEscape(appendID)), bytes.NewReader(encoded))
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Content-Type", "application/octet-stream")
-		req.Header.Set("X-Tape9-After", opts.After)
+		req.Header.Set("X-Tape9-After", after)
 		c.applySpaceSecret(req)
 		resp, err := c.http.Do(req)
 		if err != nil {
@@ -189,7 +210,7 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 		if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 			return err
 		}
-		if body.AppendID != result.AppendID {
+		if body.AppendID != appendID {
 			return fmt.Errorf("append response does not identify this batch")
 		}
 		return nil
@@ -204,5 +225,5 @@ func (c *Client) AppendAfter(ctx context.Context, spaceID, tapeID string, payloa
 			err = &AppendConflictError{TailID: *body.TailID, cause: httpErr}
 		}
 	}
-	return result, err
+	return err
 }

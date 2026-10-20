@@ -156,3 +156,49 @@ func TestAppendStateReadsConditionalTail(t *testing.T) {
 		t.Fatalf("state=%+v err=%v", state, err)
 	}
 }
+
+func TestAppendAfterCreatesTapeOnlyUntilABatchIsAccepted(t *testing.T) {
+	var creates, puts int
+	tapeExists := true
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			creates++
+			tapeExists = true
+			_, _ = io.WriteString(w, `{"tape_id":"tape-one"}`)
+			return
+		}
+		puts++
+		if !tapeExists {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":"space not found"}`)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]string{"append_id": path.Base(r.URL.Path)})
+	}))
+	defer server.Close()
+	client, err := New(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	appendBatch := func(after, id string) {
+		t.Helper()
+		if _, err := client.AppendAfter(ctx, "space-one", "tape-one", []byte(id), AppendAfterOptions{After: after, AppendID: id}); err != nil {
+			t.Fatalf("append %s: %v", id, err)
+		}
+	}
+
+	appendBatch("", "batch-1")
+	appendBatch("batch-1", "batch-2")
+	appendBatch("batch-2", "batch-3")
+	if creates != 1 || puts != 3 {
+		t.Fatalf("an accepted Tape must not be created again: creates=%d puts=%d", creates, puts)
+	}
+
+	// A server that lost the Tape entirely gets it created again.
+	tapeExists = false
+	appendBatch("", "batch-4")
+	if creates != 2 || puts != 5 {
+		t.Fatalf("a missing pinned Tape must be recreated once: creates=%d puts=%d", creates, puts)
+	}
+}

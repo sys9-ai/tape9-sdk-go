@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 // Client is the public tape9 SDK client.
@@ -25,7 +27,14 @@ type Client struct {
 	retryMax                      time.Duration
 	maxRetryTime                  time.Duration
 	framedZstdUploadFlushInterval time.Duration
+	// pinnedTapes remembers the payload format of Tapes that accepted an
+	// AppendAfter, so later batches need no create/reuse round trip.
+	pinnedTapes *lru.Cache[string, payloadFormat]
 }
+
+// pinnedTapeCacheSize bounds remembered Tapes; an evicted Tape costs one
+// create/reuse request on its next batch.
+const pinnedTapeCacheSize = 4096
 
 const (
 	spaceSecretHeader = "X-Space-Secret"
@@ -55,6 +64,11 @@ func New(endpoint string, opts ...Option) (*Client, error) {
 		return nil, fmt.Errorf("invalid max retry time: %s", cfg.maxRetryTime)
 	}
 
+	pinnedTapes, err := lru.New[string, payloadFormat](pinnedTapeCacheSize)
+	if err != nil {
+		return nil, err
+	}
+
 	return &Client{
 		baseURL:                       u,
 		http:                          cloneHTTPClient(cfg.httpClient),
@@ -64,6 +78,7 @@ func New(endpoint string, opts ...Option) (*Client, error) {
 		retryMax:                      defaultRetryMax,
 		maxRetryTime:                  cfg.maxRetryTime,
 		framedZstdUploadFlushInterval: defaultFramedZstdUploadFlushInterval,
+		pinnedTapes:                   pinnedTapes,
 	}, nil
 }
 
